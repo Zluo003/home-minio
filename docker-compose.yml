@@ -1,6 +1,6 @@
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2026-06-13T11-33-47Z
+    image: quay.io/minio/minio:latest
     container_name: home-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -21,7 +21,7 @@ services:
       retries: 5
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2026-06-13T12-46-12Z
+    image: quay.io/minio/mc:latest
     container_name: home-minio-init
     depends_on:
       minio:
@@ -43,12 +43,15 @@ services:
       HOME_MINIO_WEB_API_PORT: ${HOME_MINIO_WEB_API_PORT:-19090}
       HOME_MINIO_WEB_TOKEN: ${HOME_MINIO_WEB_TOKEN}
     command: >
-      sh -c "apk add --no-cache bash curl docker-cli &&
+      sh -c "apk add --no-cache bash curl docker-cli python3 py3-pip &&
+      python3 -m pip install --break-system-packages --no-cache-dir bypy &&
       node /app/web/backend/server.mjs"
     ports:
       - "${HOME_MINIO_WEB_API_PORT:-19090}:${HOME_MINIO_WEB_API_PORT:-19090}"
     volumes:
       - .:/app
+      - /data/backup:/data/backup
+      - /root/.bypy:/root/.bypy
       - /var/run/docker.sock:/var/run/docker.sock
 
   web:
@@ -70,8 +73,11 @@ services:
     env_file:
       - .env
     command: >
-      sh -c "apk add --no-cache bash coreutils docker-cli &&
+      sh -c "apk add --no-cache bash coreutils docker-cli python3 py3-pip &&
+      python3 -m pip install --break-system-packages --no-cache-dir bypy &&
       /app/scripts/run-baidupan-backup-scheduler.sh"
     volumes:
       - .:/app
+      - /data/backup:/data/backup
+      - /root/.bypy:/root/.bypy
       - /var/run/docker.sock:/var/run/docker.sock

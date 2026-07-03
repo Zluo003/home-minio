@@ -21,7 +21,7 @@ BAIDUPAN_TOOL="${BAIDUPAN_TOOL:-baidupcs}"
 BYPY_BIN="${BYPY_BIN:-bypy}"
 BAIDUPCS_BIN="${BAIDUPCS_BIN:-BaiduPCS-Go}"
 BAIDUPCS_MAX_PARALLEL="${BAIDUPCS_MAX_PARALLEL:-16}"
-MC_IMAGE="${MC_IMAGE:-quay.io/minio/mc:RELEASE.2026-06-13T12-46-12Z}"
+MC_IMAGE="${MC_IMAGE:-quay.io/minio/mc:latest}"
 DRY_RUN=false
 SKIP_MIRROR=false
 
@@ -44,8 +44,18 @@ fi
 command -v docker >/dev/null
 if [[ "$DRY_RUN" != "true" ]]; then
   case "$BAIDUPAN_TOOL" in
-    baidupcs) command -v "$BAIDUPCS_BIN" >/dev/null ;;
-    bypy) command -v "$BYPY_BIN" >/dev/null ;;
+    baidupcs)
+      if ! command -v "$BAIDUPCS_BIN" >/dev/null; then
+        echo "BaiduPCS-Go command not found: $BAIDUPCS_BIN" >&2
+        exit 1
+      fi
+      ;;
+    bypy)
+      if ! command -v "$BYPY_BIN" >/dev/null; then
+        echo "bypy command not found: $BYPY_BIN" >&2
+        exit 1
+      fi
+      ;;
     *)
       echo "BAIDUPAN_TOOL must be baidupcs or bypy." >&2
       exit 1
@@ -73,8 +83,9 @@ mirror_minio_bucket() {
     -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
     -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
     -e MINIO_BUCKET="$MINIO_BUCKET" \
+    --entrypoint sh \
     "$MC_IMAGE" \
-    sh -eu -c '
+    -eu -c '
       mc alias set home http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
       mc mb --ignore-existing "home/$MINIO_BUCKET" >/dev/null
       mc mirror --overwrite --preserve "home/$MINIO_BUCKET" "/backup/mirror/$MINIO_BUCKET"

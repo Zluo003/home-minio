@@ -25,7 +25,10 @@ async function api(path, options = {}) {
     return api(path, options);
   }
   const data = await response.json();
-  if (!response.ok) throw new Error(data.message || response.statusText);
+  if (!response.ok) {
+    const commandOutput = [data.stdout, data.stderr].filter(Boolean).join("\n");
+    throw new Error(commandOutput || data.message || response.statusText);
+  }
   return data;
 }
 
