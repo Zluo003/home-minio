@@ -114,6 +114,10 @@ async function runAction(path) {
   output.textContent = "执行中...";
   try {
     const result = await api(path, { method: "POST", body: "{}" });
+    if (result.job) {
+      output.textContent = `任务已启动：${result.jobId || result.job.id}\n状态：${result.job.status}`;
+      return;
+    }
     output.textContent = [result.stdout, result.stderr].filter(Boolean).join("\n") || `exit ${result.code}`;
   } catch (error) {
     output.textContent = error instanceof Error ? error.message : String(error);

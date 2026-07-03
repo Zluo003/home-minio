@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
@@ -7,6 +8,9 @@ const rootDir = resolve(new URL("../..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
 const port = Number(process.env.HOME_MINIO_WEB_API_PORT || 19090);
 const token = process.env.HOME_MINIO_WEB_TOKEN || "";
+const outputTailLimit = 12000;
+const pullJobs = new Map();
+let latestPullJobId = "";
 
 const editableKeys = [
   "MINIO_ROOT_USER",
@@ -111,6 +115,11 @@ function assertAuth(request) {
   }
 }
 
+function appendTail(current, chunk) {
+  const next = `${current}${chunk}`;
+  return next.length > outputTailLimit ? next.slice(-outputTailLimit) : next;
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolveCommand) => {
     console.log(`[home-minio] run ${command} ${args.join(" ")}`);
@@ -123,19 +132,97 @@ function runCommand(command, args, options = {}) {
     let stderr = "";
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
-      stdout += text;
+      stdout = appendTail(stdout, text);
       process.stdout.write(text);
     });
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
-      stderr += text;
+      stderr = appendTail(stderr, text);
       process.stderr.write(text);
     });
     child.on("close", (code) => {
       console.log(`[home-minio] exit ${command} ${args.join(" ")} -> ${code}`);
-      resolveCommand({ code, stdout: stdout.slice(-12000), stderr: stderr.slice(-12000) });
+      resolveCommand({ code, stdout, stderr });
     });
   });
+}
+
+function serializePullJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    code: job.code,
+    manifestPath: job.manifestPath,
+    manifestCount: job.manifestCount,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    stdout: job.stdout,
+    stderr: job.stderr,
+    error: job.error,
+  };
+}
+
+function getRunningPullJob() {
+  for (const job of pullJobs.values()) {
+    if (job.status === "RUNNING") return job;
+  }
+  return null;
+}
+
+function startPullJob(meta = {}) {
+  const runningJob = getRunningPullJob();
+  if (runningJob) {
+    return { job: runningJob, alreadyRunning: true };
+  }
+
+  const command = "node";
+  const args = ["./scripts/pull-media-manifest-to-minio.mjs"];
+  const job = {
+    id: randomUUID(),
+    status: "RUNNING",
+    code: null,
+    manifestPath: meta.manifestPath || "",
+    manifestCount: meta.manifestCount || 0,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    stdout: "",
+    stderr: "",
+    error: null,
+  };
+  pullJobs.set(job.id, job);
+  latestPullJobId = job.id;
+
+  console.log(`[home-minio] start pull job ${job.id} ${command} ${args.join(" ")}`);
+  const child = spawn(command, args, {
+    cwd: rootDir,
+    shell: false,
+    env: process.env,
+  });
+
+  child.stdout.on("data", (chunk) => {
+    const text = chunk.toString();
+    job.stdout = appendTail(job.stdout, text);
+    process.stdout.write(text);
+  });
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString();
+    job.stderr = appendTail(job.stderr, text);
+    process.stderr.write(text);
+  });
+  child.on("error", (error) => {
+    job.status = "FAILED";
+    job.error = error instanceof Error ? error.message : String(error);
+    job.finishedAt = new Date().toISOString();
+    console.error(`[home-minio] pull job ${job.id} error: ${job.error}`);
+  });
+  child.on("close", (code) => {
+    job.code = code ?? 1;
+    job.status = job.code === 0 ? "SUCCEEDED" : "FAILED";
+    job.finishedAt = new Date().toISOString();
+    console.log(`[home-minio] pull job ${job.id} exit ${job.code}`);
+  });
+
+  return { job, alreadyRunning: false };
 }
 
 async function minioReady(values) {
@@ -205,6 +292,7 @@ async function handle(request, reply) {
         remoteDir: values.BAIDUPAN_REMOTE_DIR || "/NewWaule/home-minio",
         cronSchedule: values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *",
       },
+      pullJob: latestPullJobId && pullJobs.has(latestPullJobId) ? serializePullJob(pullJobs.get(latestPullJobId)) : null,
     });
   }
 
@@ -229,11 +317,24 @@ async function handle(request, reply) {
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/pull-manifest") {
-    const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs"]);
-    return send(reply, result.code === 0 ? 200 : 500, result);
+    const { job, alreadyRunning } = startPullJob();
+    return send(reply, alreadyRunning ? 409 : 202, {
+      message: alreadyRunning ? "pull job already running" : "pull job started",
+      job: serializePullJob(job),
+      jobId: job.id,
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/pull-manifest-upload") {
+    const runningJob = getRunningPullJob();
+    if (runningJob) {
+      return send(reply, 409, {
+        message: "pull job already running",
+        job: serializePullJob(runningJob),
+        jobId: runningJob.id,
+      });
+    }
+
     const body = await readJsonBody(request);
     const manifest = typeof body.manifest === "string" ? body.manifest.trim() : "";
     if (!manifest) {
@@ -247,11 +348,22 @@ async function handle(request, reply) {
     await writeFile(manifestPath, `${manifest.replace(/\n+$/, "")}\n`, "utf8");
     console.log(`[home-minio] saved uploaded manifest ${manifestPath} lines=${manifestCount}`);
 
-    const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs"]);
-    return send(reply, result.code === 0 ? 200 : 500, {
-      ...result,
+    const { job } = startPullJob({ manifestPath, manifestCount });
+    return send(reply, 202, {
+      message: "pull job started",
+      job: serializePullJob(job),
+      jobId: job.id,
       manifestPath,
     });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/actions/pull-manifest-status") {
+    const jobId = url.searchParams.get("jobId") || latestPullJobId;
+    const job = jobId ? pullJobs.get(jobId) : null;
+    if (!job) {
+      return send(reply, 404, { message: "pull job not found" });
+    }
+    return send(reply, 200, { job: serializePullJob(job), jobId: job.id });
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/install-cron") {
