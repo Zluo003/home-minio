@@ -1,11 +1,10 @@
-import { createWriteStream } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, createHmac } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { spawn } from "node:child_process";
-import { pipeline } from "node:stream/promises";
 
 const rootDir = resolve(new URL("..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
+const emptyPayloadHash = createHash("sha256").update("").digest("hex");
 
 function parseEnv(source) {
   const values = {};
@@ -44,34 +43,236 @@ function sourceUrlObjectKey(value) {
   }
 }
 
-function run(command, args, options = {}) {
-  return new Promise((resolveRun) => {
-    const child = spawn(command, args, {
-      cwd: rootDir,
-      shell: false,
-      env: { ...process.env, ...options.env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout.on("data", (chunk) => process.stdout.write(chunk));
-    child.stderr.on("data", (chunk) => process.stderr.write(chunk));
-    child.on("close", (code) => resolveRun(code ?? 1));
+function recordSourceUrls(record) {
+  const urls = [];
+  if (Array.isArray(record.sourceUrls)) {
+    for (const url of record.sourceUrls) {
+      if (typeof url === "string" && url.trim()) {
+        urls.push(url.trim());
+      }
+    }
+  }
+  if (typeof record.sourceUrl === "string" && record.sourceUrl.trim()) {
+    urls.push(record.sourceUrl.trim());
+  }
+  return [...new Set(urls)];
+}
+
+function encodePathSegment(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function encodeObjectKeyPath(key) {
+  return key.split("/").map(encodePathSegment).join("/");
+}
+
+function readInteger(value, fallback, { min, max }) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+async function runConcurrent(items, concurrency, worker) {
+  const results = [];
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index], index);
+      }
+    }),
+  );
+  return results;
+}
+
+function formatAmzDate(date) {
+  return date.toISOString().replace(/[:-]|\.\d{3}/g, "");
+}
+
+function formatDateStamp(date) {
+  return formatAmzDate(date).slice(0, 8);
+}
+
+function hmac(key, value, encoding) {
+  return createHmac("sha256", key).update(value).digest(encoding);
+}
+
+function s3SigningKey(secretAccessKey, dateStamp, region) {
+  const kDate = hmac(`AWS4${secretAccessKey}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, "s3");
+  return hmac(kService, "aws4_request");
+}
+
+function buildS3Request(params) {
+  const endpoint = new URL(params.endpoint.replace(/\/+$/, ""));
+  const date = new Date();
+  const amzDate = formatAmzDate(date);
+  const dateStamp = formatDateStamp(date);
+  const canonicalUri = params.key
+    ? `/${encodePathSegment(params.bucket)}/${encodeObjectKeyPath(params.key)}`
+    : `/${encodePathSegment(params.bucket)}`;
+  const url = new URL(canonicalUri, `${endpoint.origin}/`);
+  const payloadHash = params.payloadHash || emptyPayloadHash;
+  const signingHeaders = {
+    host: endpoint.host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+    ...(params.headers || {}),
+  };
+  const canonicalEntries = Object.entries(signingHeaders)
+    .map(([key, value]) => [key.toLowerCase(), String(value).trim().replace(/\s+/g, " ")])
+    .sort(([left], [right]) => left.localeCompare(right));
+  const canonicalHeaders = canonicalEntries.map(([key, value]) => `${key}:${value}\n`).join("");
+  const signedHeaders = canonicalEntries.map(([key]) => key).join(";");
+  const canonicalRequest = [
+    params.method,
+    canonicalUri,
+    "",
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join("\n");
+  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    createHash("sha256").update(canonicalRequest).digest("hex"),
+  ].join("\n");
+  const signature = hmac(s3SigningKey(params.secretAccessKey, dateStamp, params.region), stringToSign, "hex");
+  const headers = {
+    ...Object.fromEntries(canonicalEntries.filter(([key]) => key !== "host")),
+    Authorization: `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  };
+  return { url, headers };
+}
+
+async function signedS3Fetch(params) {
+  const request = buildS3Request(params);
+  return fetch(request.url, {
+    method: params.method,
+    headers: request.headers,
+    body: params.body,
+    ...(params.body ? { duplex: "half" } : {}),
+    signal: AbortSignal.timeout(params.timeoutMs || 30 * 60 * 1000),
   });
 }
 
-async function downloadFile(url, targetPath) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(30 * 60 * 1000) });
-  if (!response.ok || !response.body) {
-    throw new Error(`Download failed ${response.status}: ${url}`);
+function createMinioClient(env, bucket) {
+  const accessKeyId = env.MINIO_WAULE_ACCESS_KEY || env.MINIO_ROOT_USER;
+  const secretAccessKey = env.MINIO_WAULE_SECRET_KEY || env.MINIO_ROOT_PASSWORD;
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error("Missing MinIO credentials. Set MINIO_WAULE_ACCESS_KEY/MINIO_WAULE_SECRET_KEY or MINIO_ROOT_USER/MINIO_ROOT_PASSWORD.");
   }
-  const tempPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
-  await mkdir(dirname(targetPath), { recursive: true });
+  return {
+    endpoint: env.MINIO_INTERNAL_ENDPOINT || env.MINIO_UPLOAD_ENDPOINT || "http://minio:9000",
+    region: env.MINIO_REGION || "us-east-1",
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+  };
+}
+
+async function ensureBucket(client) {
+  const head = await signedS3Fetch({ ...client, method: "HEAD", timeoutMs: 10_000 });
+  if (head.ok) return;
+  if (head.status !== 404) {
+    throw new Error(`MinIO bucket check failed ${head.status}: ${await head.text().catch(() => "")}`);
+  }
+  const put = await signedS3Fetch({ ...client, method: "PUT", timeoutMs: 30_000 });
+  if (!put.ok) {
+    throw new Error(`MinIO bucket create failed ${put.status}: ${await put.text().catch(() => "")}`);
+  }
+}
+
+async function headMinioObject(client, key) {
+  const response = await signedS3Fetch({ ...client, method: "HEAD", key, timeoutMs: 30_000 });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`MinIO HEAD failed ${response.status}: ${key}`);
+  }
+  const size = Number(response.headers.get("content-length"));
+  return Number.isFinite(size) ? { size } : {};
+}
+
+async function uploadUrlToMinio(client, key, url) {
+  const source = await fetch(url, { signal: AbortSignal.timeout(30 * 60 * 1000) });
+  if (!source.ok || !source.body) {
+    throw new Error(`Download failed ${source.status}: ${url}`);
+  }
+  const contentLength = source.headers.get("content-length");
+  if (!contentLength || !Number.isFinite(Number(contentLength))) {
+    throw new Error(`Source missing content-length: ${url}`);
+  }
+  const contentType = source.headers.get("content-type") || "application/octet-stream";
+  const upload = await signedS3Fetch({
+    ...client,
+    method: "PUT",
+    key,
+    body: source.body,
+    payloadHash: "UNSIGNED-PAYLOAD",
+    headers: {
+      "content-length": contentLength,
+      "content-type": contentType,
+    },
+    timeoutMs: 30 * 60 * 1000,
+  });
+  if (!upload.ok) {
+    throw new Error(`MinIO PUT failed ${upload.status}: ${await upload.text().catch(() => "")}`);
+  }
+}
+
+async function processRecord(record, { dryRun, minioClient }) {
+  const key = assertObjectKey(record.objectKey);
+  const sourceUrls = recordSourceUrls(record).filter((url) => sourceUrlObjectKey(url) === key);
+  if (sourceUrls.length === 0) {
+    console.error(`SKIP unsafe manifest record ${key} <- ${record.sourceUrl || ""}`);
+    return { status: "rejected" };
+  }
+  const expectedSize = record.sizeBytes ? Number(record.sizeBytes) : null;
+  if (dryRun) {
+    console.log(`DRY ${record.storageProvider} ${key} <- ${sourceUrls[0]}`);
+    return { status: "skipped" };
+  }
+  const existing = await headMinioObject(minioClient, key);
+  if (existing && (!expectedSize || existing.size === expectedSize)) {
+    console.log(`SKIP ${key}`);
+    return { status: "skipped" };
+  }
+
+  console.log(`PUT ${record.storageProvider} ${key} <- ${sourceUrls[0]}`);
+
+  const errors = [];
   try {
-    await pipeline(response.body, createWriteStream(tempPath, { flags: "wx" }));
-    await rename(tempPath, targetPath);
+    for (const sourceUrl of sourceUrls) {
+      try {
+        await uploadUrlToMinio(minioClient, key, sourceUrl);
+        return { status: "downloaded" };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${sourceUrl}: ${message}`);
+        console.error(`FAILED ${key}: ${message}`);
+      }
+    }
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
-    throw error;
+    errors.push(error instanceof Error ? error.message : String(error));
   }
+  const message = errors.join(" | ");
+  return {
+    status: "failed",
+    failedRecord: {
+      objectKey: key,
+      storageProvider: record.storageProvider,
+      sourceUrl: sourceUrls[0],
+      sourceUrls,
+      message,
+    },
+  };
 }
 
 async function main() {
@@ -80,16 +281,28 @@ async function main() {
   const bucket = env.MINIO_BUCKET || "waule-media";
   const manifestPath = resolve(rootDir, env.MEDIA_PULL_MANIFEST_PATH || "./backup/newwaule-media-manifest.jsonl");
   const workDir = resolve(rootDir, env.MEDIA_PULL_WORK_DIR || "./backup/pull");
-  const mirrorDir = resolve(workDir, "mirror", bucket);
+  const concurrency = readInteger(env.MEDIA_PULL_CONCURRENCY, 4, { min: 1, max: 32 });
+  const minioClient = createMinioClient(env, bucket);
+  if (!dryRun) {
+    await ensureBucket(minioClient);
+  }
   const manifest = await readFile(manifestPath, "utf8");
   const records = manifest
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => JSON.parse(line))
-    .filter((record) => record.objectKey && record.sourceUrl);
+    .filter((record) => record.objectKey && recordSourceUrls(record).length > 0);
+  const seenKeys = new Set();
+  const uniqueRecords = [];
+  for (const record of records) {
+    const key = String(record.objectKey || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    uniqueRecords.push(record);
+  }
 
-  console.log(JSON.stringify({ dryRun, manifestPath, bucket, records: records.length }, null, 2));
+  console.log(JSON.stringify({ dryRun, manifestPath, bucket, records: records.length, uniqueRecords: uniqueRecords.length, concurrency }, null, 2));
 
   let downloaded = 0;
   let skipped = 0;
@@ -97,70 +310,13 @@ async function main() {
   let rejected = 0;
   const failedRecords = [];
 
-  for (const record of records) {
-    const key = assertObjectKey(record.objectKey);
-    const urlKey = sourceUrlObjectKey(record.sourceUrl);
-    if (urlKey !== key) {
-      rejected += 1;
-      console.error(`SKIP unsafe manifest record ${key} <- ${record.sourceUrl}`);
-      continue;
-    }
-    const targetPath = resolve(mirrorDir, key);
-    if (!targetPath.startsWith(`${mirrorDir}/`)) {
-      throw new Error(`Invalid target path for ${key}`);
-    }
-    const expectedSize = record.sizeBytes ? Number(record.sizeBytes) : null;
-    const existing = await stat(targetPath).catch(() => null);
-    if (existing?.isFile() && (!expectedSize || existing.size === expectedSize)) {
-      skipped += 1;
-      console.log(`SKIP ${key}`);
-      continue;
-    }
-
-    console.log(`${dryRun ? "DRY" : "GET"} ${record.storageProvider} ${key} <- ${record.sourceUrl}`);
-    if (dryRun) {
-      skipped += 1;
-      continue;
-    }
-
-    try {
-      await downloadFile(record.sourceUrl, targetPath);
-      downloaded += 1;
-    } catch (error) {
-      failed += 1;
-      failedRecords.push({
-        objectKey: key,
-        storageProvider: record.storageProvider,
-        sourceUrl: record.sourceUrl,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      console.error(`FAILED ${key}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  if (!dryRun && downloaded + skipped > 0) {
-    const code = await run("docker", [
-      "run",
-      "--rm",
-      "--network",
-      "container:home-minio",
-      "-v",
-      `${workDir}:/work`,
-      "-e",
-      `MINIO_ROOT_USER=${env.MINIO_ROOT_USER}`,
-      "-e",
-      `MINIO_ROOT_PASSWORD=${env.MINIO_ROOT_PASSWORD}`,
-      "-e",
-      `MINIO_BUCKET=${bucket}`,
-      env.MC_IMAGE || "quay.io/minio/mc:RELEASE.2026-06-13T12-46-12Z",
-      "sh",
-      "-eu",
-      "-c",
-      'mc alias set home http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc mb --ignore-existing "home/$MINIO_BUCKET" >/dev/null && mc mirror --overwrite --preserve "/work/mirror/$MINIO_BUCKET" "home/$MINIO_BUCKET"',
-    ]);
-    if (code !== 0) {
-      throw new Error(`mc mirror failed with exit code ${code}`);
-    }
+  const results = await runConcurrent(uniqueRecords, concurrency, (record) => processRecord(record, { dryRun, minioClient }));
+  for (const result of results) {
+    if (result?.status === "downloaded") downloaded += 1;
+    if (result?.status === "skipped") skipped += 1;
+    if (result?.status === "failed") failed += 1;
+    if (result?.status === "rejected") rejected += 1;
+    if (result?.failedRecord) failedRecords.push(result.failedRecord);
   }
 
   if (!dryRun && failedRecords.length > 0) {
