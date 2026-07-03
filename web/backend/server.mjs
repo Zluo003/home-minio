@@ -111,6 +111,7 @@ function assertAuth(request) {
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolveCommand) => {
+    console.log(`[home-minio] run ${command} ${args.join(" ")}`);
     const child = spawn(command, args, {
       cwd: rootDir,
       shell: false,
@@ -119,12 +120,17 @@ function runCommand(command, args, options = {}) {
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      process.stdout.write(text);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      process.stderr.write(text);
     });
     child.on("close", (code) => {
+      console.log(`[home-minio] exit ${command} ${args.join(" ")} -> ${code}`);
       resolveCommand({ code, stdout: stdout.slice(-12000), stderr: stderr.slice(-12000) });
     });
   });
@@ -147,6 +153,7 @@ async function handle(request, reply) {
 
   assertAuth(request);
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  console.log(`[home-minio] ${request.method} ${url.pathname}`);
 
   if (request.method === "GET" && url.pathname === "/api/config") {
     const { values } = await readEnv();
@@ -230,11 +237,13 @@ async function handle(request, reply) {
     if (!manifest) {
       return send(reply, 400, { message: "manifest is required" });
     }
+    const manifestCount = manifest.split(/\r?\n/).filter((line) => line.trim()).length;
 
     const { values } = await readEnv();
     const manifestPath = resolve(rootDir, values.MEDIA_PULL_MANIFEST_PATH || "./backup/newwaule-media-manifest.jsonl");
     await mkdir(dirname(manifestPath), { recursive: true });
     await writeFile(manifestPath, `${manifest.replace(/\n+$/, "")}\n`, "utf8");
+    console.log(`[home-minio] saved uploaded manifest ${manifestPath} lines=${manifestCount}`);
 
     const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs"]);
     return send(reply, result.code === 0 ? 200 : 500, {
