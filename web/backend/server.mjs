@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 
 const rootDir = resolve(new URL("../..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
@@ -222,6 +222,25 @@ async function handle(request, reply) {
   if (request.method === "POST" && url.pathname === "/api/actions/pull-manifest") {
     const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs"]);
     return send(reply, result.code === 0 ? 200 : 500, result);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/actions/pull-manifest-upload") {
+    const body = await readJsonBody(request);
+    const manifest = typeof body.manifest === "string" ? body.manifest.trim() : "";
+    if (!manifest) {
+      return send(reply, 400, { message: "manifest is required" });
+    }
+
+    const { values } = await readEnv();
+    const manifestPath = resolve(rootDir, values.MEDIA_PULL_MANIFEST_PATH || "./backup/newwaule-media-manifest.jsonl");
+    await mkdir(dirname(manifestPath), { recursive: true });
+    await writeFile(manifestPath, `${manifest.replace(/\n+$/, "")}\n`, "utf8");
+
+    const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs"]);
+    return send(reply, result.code === 0 ? 200 : 500, {
+      ...result,
+      manifestPath,
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/install-cron") {
