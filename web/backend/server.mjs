@@ -22,7 +22,8 @@ const editableKeys = [
   "HOME_MINIO_WEB_TOKEN",
   "HOME_MINIO_PUBLIC_ENDPOINT",
   "HOME_MINIO_CONSOLE_PUBLIC_URL",
-  "NEWWAULE_PUBLIC_BASE_URL",
+  "MEDIA_PULL_MANIFEST_PATH",
+  "MEDIA_PULL_WORK_DIR",
   "BAIDUPAN_BACKUP_ENABLED",
   "BAIDUPAN_TOOL",
   "BAIDUPAN_REMOTE_DIR",
@@ -178,16 +179,16 @@ async function handle(request, reply) {
         minioEndpoint: values.HOME_MINIO_PUBLIC_ENDPOINT || "",
         minioConsole: values.HOME_MINIO_CONSOLE_PUBLIC_URL || "",
       },
-      newWauleEnv: {
-        HOME_MINIO_ENABLED: "true",
-        HOME_MINIO_ENDPOINT: values.HOME_MINIO_PUBLIC_ENDPOINT || "",
-        HOME_MINIO_REGION: "us-east-1",
-        HOME_MINIO_BUCKET: values.MINIO_BUCKET || "waule-media",
-        HOME_MINIO_ACCESS_KEY_ID: values.MINIO_WAULE_ACCESS_KEY || "",
-        HOME_MINIO_SECRET_ACCESS_KEY: values.MINIO_WAULE_SECRET_KEY || "",
-        HOME_MINIO_FORCE_PATH_STYLE: "true",
-        HOME_MINIO_CACHE_DIR: "storage/local-media",
-        HOME_MINIO_PUBLIC_BASE_URL: values.NEWWAULE_PUBLIC_BASE_URL || "https://api.example.com",
+      newWauleConfig: {
+        enabled: "true",
+        endpoint: values.HOME_MINIO_PUBLIC_ENDPOINT || "",
+        region: "us-east-1",
+        bucket: values.MINIO_BUCKET || "waule-media",
+        accessKeyId: values.MINIO_WAULE_ACCESS_KEY || "",
+        secretAccessKey: values.MINIO_WAULE_SECRET_KEY || "",
+        forcePathStyle: "true",
+        cacheDir: "storage/local-media",
+        publicBaseUrl: "https://api.example.com",
       },
       baidupan: {
         enabled: values.BAIDUPAN_BACKUP_ENABLED === "true",
@@ -210,6 +211,16 @@ async function handle(request, reply) {
 
   if (request.method === "POST" && url.pathname === "/api/actions/restore-dry-run") {
     const result = await runCommand("bash", ["./scripts/restore-from-baidupan.sh", "--dry-run"]);
+    return send(reply, result.code === 0 ? 200 : 500, result);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/actions/pull-manifest-dry-run") {
+    const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs", "--dry-run"]);
+    return send(reply, result.code === 0 ? 200 : 500, result);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/actions/pull-manifest") {
+    const result = await runCommand("node", ["./scripts/pull-media-manifest-to-minio.mjs"]);
     return send(reply, result.code === 0 ? 200 : 500, result);
   }
 
