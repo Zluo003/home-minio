@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
@@ -85,6 +85,7 @@ async function main() {
   let downloaded = 0;
   let skipped = 0;
   let failed = 0;
+  const failedRecords = [];
 
   for (const record of records) {
     const key = assertObjectKey(record.objectKey);
@@ -111,11 +112,17 @@ async function main() {
       downloaded += 1;
     } catch (error) {
       failed += 1;
+      failedRecords.push({
+        objectKey: key,
+        storageProvider: record.storageProvider,
+        sourceUrl: record.sourceUrl,
+        message: error instanceof Error ? error.message : String(error),
+      });
       console.error(`FAILED ${key}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  if (!dryRun && failed === 0) {
+  if (!dryRun && downloaded + skipped > 0) {
     const code = await run("docker", [
       "run",
       "--rm",
@@ -138,6 +145,13 @@ async function main() {
     if (code !== 0) {
       throw new Error(`mc mirror failed with exit code ${code}`);
     }
+  }
+
+  if (!dryRun && failedRecords.length > 0) {
+    const failedPath = resolve(workDir, `failed-${Date.now()}.jsonl`);
+    await mkdir(dirname(failedPath), { recursive: true });
+    await writeFile(failedPath, `${failedRecords.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+    console.error(`FAILED_RECORDS ${failedPath}`);
   }
 
   console.log(JSON.stringify({ downloaded, skipped, failed }, null, 2));
