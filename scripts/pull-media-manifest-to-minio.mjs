@@ -35,6 +35,20 @@ function assertObjectKey(value) {
   return key;
 }
 
+const ARCHIVABLE_OBJECT_KEY_PREFIXES = ["New-Waule/Result/", "uploads/"];
+
+function isArchivableObjectKey(key) {
+  return ARCHIVABLE_OBJECT_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function sourceUrlObjectKey(value) {
+  try {
+    return new URL(String(value || "")).pathname.replace(/^\/+/, "");
+  } catch {
+    return "";
+  }
+}
+
 function run(command, args, options = {}) {
   return new Promise((resolveRun) => {
     const child = spawn(command, args, {
@@ -85,10 +99,17 @@ async function main() {
   let downloaded = 0;
   let skipped = 0;
   let failed = 0;
+  let rejected = 0;
   const failedRecords = [];
 
   for (const record of records) {
     const key = assertObjectKey(record.objectKey);
+    const urlKey = sourceUrlObjectKey(record.sourceUrl);
+    if (!isArchivableObjectKey(key) || urlKey !== key) {
+      rejected += 1;
+      console.error(`SKIP unsafe manifest record ${key} <- ${record.sourceUrl}`);
+      continue;
+    }
     const targetPath = resolve(mirrorDir, key);
     if (!targetPath.startsWith(`${mirrorDir}/`)) {
       throw new Error(`Invalid target path for ${key}`);
@@ -154,7 +175,7 @@ async function main() {
     console.error(`FAILED_RECORDS ${failedPath}`);
   }
 
-  console.log(JSON.stringify({ downloaded, skipped, failed }, null, 2));
+  console.log(JSON.stringify({ downloaded, skipped, failed, rejected }, null, 2));
 }
 
 main().catch((error) => {
