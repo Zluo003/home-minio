@@ -35,7 +35,7 @@ function assertObjectKey(value) {
   return key;
 }
 
-const ARCHIVABLE_OBJECT_KEY_PREFIXES = ["New-Waule/Result/", "uploads/"];
+const ARCHIVABLE_OBJECT_KEY_PREFIXES = ["New-Waule/Result/", "uploads/", "gateway-media/"];
 
 function isArchivableObjectKey(key) {
   return ARCHIVABLE_OBJECT_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
@@ -43,7 +43,8 @@ function isArchivableObjectKey(key) {
 
 function sourceUrlObjectKey(value) {
   try {
-    return new URL(String(value || "")).pathname.replace(/^\/+/, "");
+    const key = new URL(String(value || "")).pathname.replace(/^\/+/, "");
+    return key.startsWith("local-media/") ? key.slice("local-media/".length) : key;
   } catch {
     return "";
   }
