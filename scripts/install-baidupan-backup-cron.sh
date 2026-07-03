@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CRON_TIME="${1:-35 3 * * *}"
+CRON_TIME="${1:-${BAIDUPAN_CRON_SCHEDULE:-35 3 * * *}}"
 LOG_FILE="${2:-$ROOT_DIR/backup/logs/baidupan-cron.log}"
 COMMAND="cd $ROOT_DIR && ./scripts/backup-to-baidupan.sh >> $LOG_FILE 2>&1"
 ENTRY="$CRON_TIME $COMMAND"

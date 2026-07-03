@@ -61,3 +61,17 @@ services:
       - "${HOME_MINIO_WEB_PORT:-19091}:80"
     volumes:
       - ./web/frontend:/usr/share/nginx/html:ro
+
+  backup-scheduler:
+    image: node:22-alpine
+    container_name: home-minio-backup-scheduler
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - .env
+    command: >
+      sh -c "apk add --no-cache bash coreutils docker-cli &&
+      /app/scripts/run-baidupan-backup-scheduler.sh"
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock

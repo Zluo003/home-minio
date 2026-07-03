@@ -195,6 +195,10 @@ select {
   white-space: pre-wrap;
 }
 
+.output--compact {
+  min-height: 140px;
+}
+
 @media (max-width: 900px) {
   .shell {
     grid-template-columns: 1fr;

@@ -20,10 +20,14 @@ const editableKeys = [
   "HOME_MINIO_WEB_API_PORT",
   "HOME_MINIO_WEB_PORT",
   "HOME_MINIO_WEB_TOKEN",
+  "HOME_MINIO_PUBLIC_ENDPOINT",
+  "HOME_MINIO_CONSOLE_PUBLIC_URL",
+  "NEWWAULE_PUBLIC_BASE_URL",
   "BAIDUPAN_BACKUP_ENABLED",
   "BAIDUPAN_TOOL",
   "BAIDUPAN_REMOTE_DIR",
   "BAIDUPAN_WORK_DIR",
+  "BAIDUPAN_CRON_SCHEDULE",
   "BYPY_BIN",
   "BAIDUPCS_BIN",
   "BAIDUPCS_MAX_PARALLEL",
@@ -170,10 +174,26 @@ async function handle(request, reply) {
         webApi: values.HOME_MINIO_WEB_API_PORT || "19090",
         web: values.HOME_MINIO_WEB_PORT || "19091",
       },
+      publicUrls: {
+        minioEndpoint: values.HOME_MINIO_PUBLIC_ENDPOINT || "",
+        minioConsole: values.HOME_MINIO_CONSOLE_PUBLIC_URL || "",
+      },
+      newWauleEnv: {
+        HOME_MINIO_ENABLED: "true",
+        HOME_MINIO_ENDPOINT: values.HOME_MINIO_PUBLIC_ENDPOINT || "",
+        HOME_MINIO_REGION: "us-east-1",
+        HOME_MINIO_BUCKET: values.MINIO_BUCKET || "waule-media",
+        HOME_MINIO_ACCESS_KEY_ID: values.MINIO_WAULE_ACCESS_KEY || "",
+        HOME_MINIO_SECRET_ACCESS_KEY: values.MINIO_WAULE_SECRET_KEY || "",
+        HOME_MINIO_FORCE_PATH_STYLE: "true",
+        HOME_MINIO_CACHE_DIR: "storage/local-media",
+        HOME_MINIO_PUBLIC_BASE_URL: values.NEWWAULE_PUBLIC_BASE_URL || "https://api.example.com",
+      },
       baidupan: {
         enabled: values.BAIDUPAN_BACKUP_ENABLED === "true",
         tool: values.BAIDUPAN_TOOL || "baidupcs",
         remoteDir: values.BAIDUPAN_REMOTE_DIR || "/NewWaule/home-minio",
+        cronSchedule: values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *",
       },
     });
   }
@@ -191,6 +211,25 @@ async function handle(request, reply) {
   if (request.method === "POST" && url.pathname === "/api/actions/restore-dry-run") {
     const result = await runCommand("bash", ["./scripts/restore-from-baidupan.sh", "--dry-run"]);
     return send(reply, result.code === 0 ? 200 : 500, result);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/actions/install-cron") {
+    const { values } = await readEnv();
+    const schedule = values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *";
+    return send(reply, 200, {
+      code: 0,
+      stdout: `自动备份计划已保存为：${schedule}\nDocker 调度服务 home-minio-backup-scheduler 会按该时间运行。\n如果刚修改了时间，请执行 docker compose up -d --force-recreate backup-scheduler 让调度容器读取新配置。`,
+      stderr: "",
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/cron") {
+    const { values } = await readEnv();
+    return send(reply, 200, {
+      code: 0,
+      stdout: `BAIDUPAN_BACKUP_ENABLED=${values.BAIDUPAN_BACKUP_ENABLED || "false"}\nBAIDUPAN_CRON_SCHEDULE=${values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *"}\nservice=home-minio-backup-scheduler`,
+      stderr: "",
+    });
   }
 
   return send(reply, 404, { message: "Not found" });

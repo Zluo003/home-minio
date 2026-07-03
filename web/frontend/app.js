@@ -41,10 +41,14 @@ const labels = {
   HOME_MINIO_WEB_API_PORT: "管理后端端口",
   HOME_MINIO_WEB_PORT: "管理前端端口",
   HOME_MINIO_WEB_TOKEN: "管理控制台令牌",
+  HOME_MINIO_PUBLIC_ENDPOINT: "MinIO 访问地址",
+  HOME_MINIO_CONSOLE_PUBLIC_URL: "MinIO 控制台地址",
+  NEWWAULE_PUBLIC_BASE_URL: "NewWaule 公网 URL",
   BAIDUPAN_BACKUP_ENABLED: "启用百度网盘备份",
   BAIDUPAN_TOOL: "百度网盘工具",
   BAIDUPAN_REMOTE_DIR: "百度网盘目录",
   BAIDUPAN_WORK_DIR: "本地备份工作目录",
+  BAIDUPAN_CRON_SCHEDULE: "自动备份时间",
   BYPY_BIN: "bypy 命令",
   BAIDUPCS_BIN: "BaiduPCS-Go 命令",
   BAIDUPCS_MAX_PARALLEL: "BaiduPCS-Go 并发",
@@ -75,9 +79,13 @@ async function loadStatus() {
   const status = await api("/api/status");
   document.getElementById("statusText").textContent = status.minio.ok ? "MinIO online" : "MinIO offline";
   document.getElementById("portText").textContent = `API ${status.ports.minioApi} · Console ${status.ports.minioConsole} · Web ${status.ports.web}`;
-  document.getElementById("minioState").textContent = status.minio.ok ? status.minio.endpoint : status.minio.error || "offline";
+  document.getElementById("minioState").textContent = status.publicUrls.minioEndpoint || (status.minio.ok ? status.minio.endpoint : status.minio.error || "offline");
   document.getElementById("baidupanState").textContent = status.baidupan.enabled ? status.baidupan.remoteDir : "未启用";
-  document.getElementById("toolState").textContent = status.baidupan.tool;
+  document.getElementById("toolState").textContent = `${status.baidupan.tool} · ${status.baidupan.cronSchedule}`;
+  const envText = Object.entries(status.newWauleEnv)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+  document.getElementById("newWauleEnv").textContent = envText;
 }
 
 async function saveConfig() {
@@ -100,6 +108,16 @@ async function runAction(path) {
   }
 }
 
+async function runGetAction(path) {
+  output.textContent = "执行中...";
+  try {
+    const result = await api(path);
+    output.textContent = [result.stdout, result.stderr].filter(Boolean).join("\n") || `exit ${result.code}`;
+  } catch (error) {
+    output.textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
 document.getElementById("refreshButton").addEventListener("click", () => {
   loadStatus().catch((error) => {
     output.textContent = error.message;
@@ -108,7 +126,13 @@ document.getElementById("refreshButton").addEventListener("click", () => {
 document.getElementById("saveButton").addEventListener("click", saveConfig);
 document.getElementById("dryRunButton").addEventListener("click", () => runAction("/api/actions/backup-dry-run"));
 document.getElementById("backupButton").addEventListener("click", () => runAction("/api/actions/backup"));
+document.getElementById("installCronButton").addEventListener("click", () => runAction("/api/actions/install-cron"));
+document.getElementById("showCronButton").addEventListener("click", () => runGetAction("/api/cron"));
 document.getElementById("restoreDryRunButton").addEventListener("click", () => runAction("/api/actions/restore-dry-run"));
+document.getElementById("copyEnvButton").addEventListener("click", async () => {
+  await navigator.clipboard.writeText(document.getElementById("newWauleEnv").textContent || "");
+  output.textContent = "NewWaule 环境变量已复制。";
+});
 
 await loadConfig();
 await loadStatus();

@@ -34,10 +34,24 @@ Open the local management console:
 http://<home-server-ip>:19091
 ```
 
-The web console reads and updates `.env`, checks MinIO readiness, and can trigger Baidu Netdisk backup dry-runs or backups. If `HOME_MINIO_WEB_TOKEN` is set, the browser will ask for it on first use. Port, account, and MinIO credential changes require restarting compose:
+The web console reads and updates `.env`, checks MinIO readiness, and can trigger Baidu Netdisk backup dry-runs or backups. If `HOME_MINIO_WEB_TOKEN` is set, the browser will ask for it on first use. Port, account, MinIO credential, and backup schedule changes require restarting compose:
 
 ```bash
 docker compose up -d --force-recreate
+```
+
+Set the MinIO address that NewWaule should use. In production this is usually a Tailscale/WireGuard address reachable from the Hong Kong server:
+
+```env
+HOME_MINIO_PUBLIC_ENDPOINT=http://100.x.y.z:19000
+HOME_MINIO_CONSOLE_PUBLIC_URL=http://100.x.y.z:19001
+NEWWAULE_PUBLIC_BASE_URL=https://api.example.com
+```
+
+`NEWWAULE_PUBLIC_BASE_URL` is the public NewWaule API root. It is copied into NewWaule as `HOME_MINIO_PUBLIC_BASE_URL`, so migrated media URLs become:
+
+```text
+https://api.example.com/local-media/<objectKey>
 ```
 
 ## NewWaule Environment
@@ -127,6 +141,7 @@ BAIDUPAN_BACKUP_ENABLED=true
 BAIDUPAN_TOOL=baidupcs
 BAIDUPAN_REMOTE_DIR=NewWaule/home-minio
 BAIDUPAN_WORK_DIR=./backup
+BAIDUPAN_CRON_SCHEDULE=35 3 * * *
 BYPY_BIN=bypy
 BAIDUPCS_BIN=BaiduPCS-Go
 BAIDUPCS_MAX_PARALLEL=16
@@ -146,10 +161,10 @@ Run the real backup:
 
 The script first mirrors MinIO objects to `backup/mirror/<bucket>/`, then uploads new or changed files to Baidu Netdisk. It records uploaded file signatures in `backup/state/baidupan-uploaded.tsv`, so repeated runs skip unchanged files and do not delete anything from Baidu Netdisk.
 
-Install a daily cron job:
+Automatic backup is handled by the `backup-scheduler` compose service. It reads `BAIDUPAN_CRON_SCHEDULE`; the current format supports daily schedules such as `35 3 * * *`.
 
 ```bash
-./scripts/install-baidupan-backup-cron.sh "35 3 * * *"
+docker compose up -d --force-recreate backup-scheduler
 ```
 
 ## Restore From Baidu Netdisk
