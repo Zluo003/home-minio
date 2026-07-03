@@ -35,12 +35,6 @@ function assertObjectKey(value) {
   return key;
 }
 
-const ARCHIVABLE_OBJECT_KEY_PREFIXES = ["New-Waule/Result/", "uploads/", "gateway-media/"];
-
-function isArchivableObjectKey(key) {
-  return ARCHIVABLE_OBJECT_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
-}
-
 function sourceUrlObjectKey(value) {
   try {
     const key = new URL(String(value || "")).pathname.replace(/^\/+/, "");
@@ -106,7 +100,7 @@ async function main() {
   for (const record of records) {
     const key = assertObjectKey(record.objectKey);
     const urlKey = sourceUrlObjectKey(record.sourceUrl);
-    if (!isArchivableObjectKey(key) || urlKey !== key) {
+    if (urlKey !== key) {
       rejected += 1;
       console.error(`SKIP unsafe manifest record ${key} <- ${record.sourceUrl}`);
       continue;
