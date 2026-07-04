@@ -227,7 +227,10 @@ BYPY_BIN=bypy
 BAIDUPCS_BIN=BaiduPCS-Go
 BAIDUPCS_CONFIG_DIR=/root/.config/BaiduPCS-Go
 BAIDUPCS_MAX_PARALLEL=16
+BAIDUPCS_UPLOAD_NORAPID=true
 ```
+
+`BAIDUPCS_UPLOAD_NORAPID=true` is recommended. Some valid BaiduPCS-Go sessions can run `who` and `quota`, but the rapid-upload metadata API still fails with `获取用户uk错误` or `请确保登录信息包含了STOKEN`. Skipping rapid upload avoids that API path and uses normal file upload.
 
 Run a dry check first:
 

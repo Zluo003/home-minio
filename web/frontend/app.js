@@ -59,6 +59,7 @@ const labels = {
   BAIDUPCS_BIN: "BaiduPCS-Go 命令",
   BAIDUPCS_CONFIG_DIR: "BaiduPCS-Go 配置目录",
   BAIDUPCS_MAX_PARALLEL: "BaiduPCS-Go 并发",
+  BAIDUPCS_UPLOAD_NORAPID: "跳过秒传",
 };
 
 const secretKeys = new Set(["MINIO_ROOT_PASSWORD", "MINIO_WAULE_SECRET_KEY", "HOME_MINIO_WEB_TOKEN"]);

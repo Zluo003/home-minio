@@ -21,6 +21,7 @@ BAIDUPAN_TOOL="${BAIDUPAN_TOOL:-baidupcs}"
 BYPY_BIN="${BYPY_BIN:-bypy}"
 BAIDUPCS_BIN="${BAIDUPCS_BIN:-BaiduPCS-Go}"
 BAIDUPCS_MAX_PARALLEL="${BAIDUPCS_MAX_PARALLEL:-16}"
+BAIDUPCS_UPLOAD_NORAPID="${BAIDUPCS_UPLOAD_NORAPID:-true}"
 MC_IMAGE="${MC_IMAGE:-quay.io/minio/mc:latest}"
 DRY_RUN=false
 SKIP_MIRROR=false
@@ -141,9 +142,16 @@ upload_with_baidupcs() {
   local file="$1"
   local remote="$2"
   local remote_dir
+  local upload_args=()
   remote_dir="$(remote_dirname "$remote")"
   "$BAIDUPCS_BIN" mkdir "$remote_dir" >/dev/null 2>&1 || true
-  "$BAIDUPCS_BIN" upload "$file" "$remote_dir" --policy rsync
+  if [[ "$BAIDUPCS_UPLOAD_NORAPID" == "true" ]]; then
+    upload_args+=(--norapid)
+  fi
+  if [[ "$BAIDUPCS_MAX_PARALLEL" =~ ^[0-9]+$ ]] && [[ "$BAIDUPCS_MAX_PARALLEL" -gt 0 ]]; then
+    upload_args+=(-p "$BAIDUPCS_MAX_PARALLEL")
+  fi
+  "$BAIDUPCS_BIN" upload "$file" "$remote_dir" --policy rsync "${upload_args[@]}"
 }
 
 upload_with_bypy() {

@@ -39,6 +39,7 @@ const editableKeys = [
   "BAIDUPCS_BIN",
   "BAIDUPCS_CONFIG_DIR",
   "BAIDUPCS_MAX_PARALLEL",
+  "BAIDUPCS_UPLOAD_NORAPID",
 ];
 
 function parseEnv(source) {
