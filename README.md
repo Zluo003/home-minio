@@ -183,6 +183,19 @@ BaiduPCS-Go who
 BaiduPCS-Go quota
 ```
 
+The Docker web API and backup scheduler install `BaiduPCS-Go` inside their containers at startup. They also mount the host login config into `/root/.config/BaiduPCS-Go` by default. If you logged in as `root`, keep:
+
+```env
+BAIDUPCS_CONFIG_DIR=/root/.config/BaiduPCS-Go
+```
+
+If you logged in as another Linux user, point `BAIDUPCS_CONFIG_DIR` to that user's BaiduPCS-Go config directory, for example `/home/your-user/.config/BaiduPCS-Go`. After changing this value, recreate the backup containers:
+
+```bash
+docker compose up -d --force-recreate web-api backup-scheduler
+docker exec -it home-minio-web-api BaiduPCS-Go who
+```
+
 `bypy` is kept as a fallback only:
 
 ```bash
@@ -212,6 +225,7 @@ BAIDUPAN_WORK_DIR=./backup
 BAIDUPAN_CRON_SCHEDULE=35 3 * * *
 BYPY_BIN=bypy
 BAIDUPCS_BIN=BaiduPCS-Go
+BAIDUPCS_CONFIG_DIR=/root/.config/BaiduPCS-Go
 BAIDUPCS_MAX_PARALLEL=16
 ```
 

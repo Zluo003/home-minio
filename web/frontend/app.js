@@ -57,6 +57,7 @@ const labels = {
   BAIDUPAN_CRON_SCHEDULE: "自动备份时间",
   BYPY_BIN: "bypy 命令",
   BAIDUPCS_BIN: "BaiduPCS-Go 命令",
+  BAIDUPCS_CONFIG_DIR: "BaiduPCS-Go 配置目录",
   BAIDUPCS_MAX_PARALLEL: "BaiduPCS-Go 并发",
 };
 

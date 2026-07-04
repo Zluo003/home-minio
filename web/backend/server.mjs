@@ -37,6 +37,7 @@ const editableKeys = [
   "BAIDUPAN_CRON_SCHEDULE",
   "BYPY_BIN",
   "BAIDUPCS_BIN",
+  "BAIDUPCS_CONFIG_DIR",
   "BAIDUPCS_MAX_PARALLEL",
 ];
 
