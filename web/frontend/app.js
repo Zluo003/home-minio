@@ -47,6 +47,10 @@ const labels = {
   HOME_MINIO_WEB_TOKEN: "管理控制台令牌",
   HOME_MINIO_PUBLIC_ENDPOINT: "MinIO 访问地址",
   HOME_MINIO_CONSOLE_PUBLIC_URL: "MinIO 控制台地址",
+  NEWWAULE_API_BASE_URL: "NewWaule API 公网地址",
+  NEWWAULE_CACHE_UPLOAD_BASE_URL: "缓存上传基地址",
+  NEWWAULE_HOME_MINIO_TOKEN: "NewWaule 推送令牌",
+  CACHE_PUSH_CONCURRENCY: "缓存推送并发",
   MEDIA_PULL_MANIFEST_PATH: "媒体拉取清单",
   MEDIA_PULL_WORK_DIR: "媒体拉取工作目录",
   MEDIA_PULL_CONCURRENCY: "媒体拉取并发",
@@ -62,7 +66,7 @@ const labels = {
   BAIDUPCS_UPLOAD_NORAPID: "跳过秒传",
 };
 
-const secretKeys = new Set(["MINIO_ROOT_PASSWORD", "MINIO_WAULE_SECRET_KEY", "HOME_MINIO_WEB_TOKEN"]);
+const secretKeys = new Set(["MINIO_ROOT_PASSWORD", "MINIO_WAULE_SECRET_KEY", "HOME_MINIO_WEB_TOKEN", "NEWWAULE_HOME_MINIO_TOKEN"]);
 
 function renderForm(values, keys) {
   form.innerHTML = keys.map((key) => {
@@ -89,7 +93,9 @@ async function loadStatus() {
   document.getElementById("portText").textContent = `API ${status.ports.minioApi} · Console ${status.ports.minioConsole} · Web ${status.ports.web}`;
   document.getElementById("minioState").textContent = status.publicUrls.minioEndpoint || (status.minio.ok ? status.minio.endpoint : status.minio.error || "offline");
   document.getElementById("baidupanState").textContent = status.baidupan.enabled ? status.baidupan.remoteDir : "未启用";
-  document.getElementById("toolState").textContent = `${status.baidupan.tool} · ${status.baidupan.cronSchedule}`;
+  document.getElementById("toolState").textContent = status.cachePush?.latestJob
+    ? `push ${status.cachePush.latestJob.status} · ${status.cachePush.concurrency}`
+    : `${status.baidupan.tool} · ${status.baidupan.cronSchedule}`;
   const configText = Object.entries(status.newWauleConfig)
     .map(([key, value]) => `${key}: ${value}`)
     .join("\n");

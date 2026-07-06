@@ -68,7 +68,7 @@ Bucket: MINIO_BUCKET
 AccessKeyId: MINIO_WAULE_ACCESS_KEY
 SecretKey: MINIO_WAULE_SECRET_KEY
 Path Style: true
-缓存目录: storage/local-media
+缓存目录: storage/home-minio-cache
 NewWaule 公网 URL: https://api.example.com
 Home MinIO 管理 API: http://100.x.y.z:19090
 管理 API 令牌: HOME_MINIO_WEB_TOKEN
@@ -80,16 +80,28 @@ Home MinIO 管理 API: http://100.x.y.z:19090
 https://api.example.com/local-media/<objectKey>
 ```
 
-The file itself is stored in home MinIO. When users request the URL, NewWaule first checks its local cache directory, then pulls the object from home MinIO and caches it on the Hong Kong server.
+The file itself is stored in home MinIO. When users request the URL, NewWaule first checks its local cache directory. If the object is missing, NewWaule sends a small control request to the home-minio Web API, and home-minio actively pushes the object back to the NewWaule public API cache endpoint.
 
 Connection direction:
 
 ```text
-NewWaule API/worker -> Home MinIO S3 endpoint
-NewWaule admin -> home-minio Web API
+NewWaule API/worker -> home-minio Web API control request
+home-minio -> NewWaule public API cache upload
+NewWaule admin -> home-minio Web API archive control
 home-minio pull script -> manifest sourceUrl
 browser/user -> NewWaule /local-media/<objectKey>
 ```
+
+For cache push, keep these values in home-minio `.env` or pass them from NewWaule admin:
+
+```env
+NEWWAULE_API_BASE_URL=https://api.example.com
+NEWWAULE_CACHE_UPLOAD_BASE_URL=
+NEWWAULE_HOME_MINIO_TOKEN=HOME_MINIO_WEB_TOKEN
+CACHE_PUSH_CONCURRENCY=4
+```
+
+`NEWWAULE_HOME_MINIO_TOKEN` should match the `管理 API 令牌` saved in NewWaule. `NEWWAULE_CACHE_UPLOAD_BASE_URL` can stay empty when NewWaule triggers the push, because NewWaule sends the exact upload endpoint. The MinIO S3 endpoint can still stay on Tailscale/WireGuard for private control and archive verification, but large cache transfers are pushed from home-minio to NewWaule over the public NewWaule API path.
 
 ## Pull Media From NewWaule Manifest
 

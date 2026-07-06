@@ -11,6 +11,10 @@ const token = process.env.HOME_MINIO_WEB_TOKEN || "";
 const outputTailLimit = 12000;
 const pullJobs = new Map();
 let latestPullJobId = "";
+const pushJobs = new Map();
+const pushQueue = [];
+let activePushJobs = 0;
+let latestPushJobId = "";
 
 const editableKeys = [
   "MINIO_ROOT_USER",
@@ -27,6 +31,10 @@ const editableKeys = [
   "HOME_MINIO_WEB_TOKEN",
   "HOME_MINIO_PUBLIC_ENDPOINT",
   "HOME_MINIO_CONSOLE_PUBLIC_URL",
+  "NEWWAULE_API_BASE_URL",
+  "NEWWAULE_CACHE_UPLOAD_BASE_URL",
+  "NEWWAULE_HOME_MINIO_TOKEN",
+  "CACHE_PUSH_CONCURRENCY",
   "MEDIA_PULL_MANIFEST_PATH",
   "MEDIA_PULL_WORK_DIR",
   "MEDIA_PULL_CONCURRENCY",
@@ -122,6 +130,12 @@ function appendTail(current, chunk) {
   return next.length > outputTailLimit ? next.slice(-outputTailLimit) : next;
 }
 
+function readInteger(value, fallback, { min, max }) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolveCommand) => {
     console.log(`[home-minio] run ${command} ${args.join(" ")}`);
@@ -156,6 +170,22 @@ function serializePullJob(job) {
     code: job.code,
     manifestPath: job.manifestPath,
     manifestCount: job.manifestCount,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    stdout: job.stdout,
+    stderr: job.stderr,
+    error: job.error,
+  };
+}
+
+function serializePushJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    code: job.code,
+    objectKey: job.objectKey,
+    newWauleApiUrl: job.newWauleApiUrl,
+    cacheUploadBaseUrl: job.cacheUploadBaseUrl,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     stdout: job.stdout,
@@ -227,6 +257,107 @@ function startPullJob(meta = {}) {
   return { job, alreadyRunning: false };
 }
 
+function normalizeObjectKey(value) {
+  const key = String(value || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!key || key.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
+    return "";
+  }
+  return key;
+}
+
+function getActivePushJobForKey(objectKey) {
+  for (const job of pushJobs.values()) {
+    if (job.objectKey === objectKey && (job.status === "QUEUED" || job.status === "RUNNING")) {
+      return job;
+    }
+  }
+  return null;
+}
+
+function pushConcurrency() {
+  return readInteger(process.env.CACHE_PUSH_CONCURRENCY, 4, { min: 1, max: 32 });
+}
+
+function drainPushQueue() {
+  while (activePushJobs < pushConcurrency() && pushQueue.length > 0) {
+    const jobId = pushQueue.shift();
+    const job = pushJobs.get(jobId);
+    if (!job || job.status !== "QUEUED") continue;
+
+    activePushJobs += 1;
+    job.status = "RUNNING";
+    job.startedAt = new Date().toISOString();
+    const command = "node";
+    const args = ["./scripts/push-minio-object-to-newwaule.mjs", job.objectKey];
+    console.log(`[home-minio] start push job ${job.id} ${command} ${args.join(" ")}`);
+    const child = spawn(command, args, {
+      cwd: rootDir,
+      shell: false,
+      env: { ...process.env, ...job.env },
+    });
+
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      job.stdout = appendTail(job.stdout, text);
+      process.stdout.write(text);
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      job.stderr = appendTail(job.stderr, text);
+      process.stderr.write(text);
+    });
+    child.on("error", (error) => {
+      activePushJobs = Math.max(0, activePushJobs - 1);
+      job.status = "FAILED";
+      job.error = error instanceof Error ? error.message : String(error);
+      job.finishedAt = new Date().toISOString();
+      console.error(`[home-minio] push job ${job.id} error: ${job.error}`);
+      drainPushQueue();
+    });
+    child.on("close", (code) => {
+      activePushJobs = Math.max(0, activePushJobs - 1);
+      job.code = code ?? 1;
+      job.status = job.code === 0 ? "SUCCEEDED" : "FAILED";
+      job.finishedAt = new Date().toISOString();
+      console.log(`[home-minio] push job ${job.id} exit ${job.code}`);
+      drainPushQueue();
+    });
+  }
+}
+
+function startPushJob(params) {
+  const objectKey = normalizeObjectKey(params.objectKey);
+  if (!objectKey) {
+    const error = new Error("objectKey is required");
+    error.statusCode = 400;
+    throw error;
+  }
+  const existing = getActivePushJobForKey(objectKey);
+  if (existing) {
+    return { job: existing, alreadyRunning: true };
+  }
+
+  const job = {
+    id: randomUUID(),
+    status: "QUEUED",
+    code: null,
+    objectKey,
+    newWauleApiUrl: params.newWauleApiUrl,
+    cacheUploadBaseUrl: params.cacheUploadBaseUrl,
+    startedAt: null,
+    finishedAt: null,
+    stdout: "",
+    stderr: "",
+    error: null,
+    env: params.env,
+  };
+  pushJobs.set(job.id, job);
+  pushQueue.push(job.id);
+  latestPushJobId = job.id;
+  drainPushQueue();
+  return { job, alreadyRunning: false };
+}
+
 async function minioReady(values) {
   const apiPort = values.MINIO_API_PORT || "19000";
   try {
@@ -285,8 +416,13 @@ async function handle(request, reply) {
         accessKeyId: values.MINIO_WAULE_ACCESS_KEY || "",
         secretAccessKey: values.MINIO_WAULE_SECRET_KEY || "",
         forcePathStyle: "true",
-        cacheDir: "storage/local-media",
-        publicBaseUrl: "https://api.example.com",
+        cacheDir: "storage/home-minio-cache",
+        publicBaseUrl: values.NEWWAULE_API_BASE_URL || "https://api.example.com",
+      },
+      cachePush: {
+        newWauleApiUrl: values.NEWWAULE_API_BASE_URL || "",
+        concurrency: values.CACHE_PUSH_CONCURRENCY || "4",
+        latestJob: latestPushJobId && pushJobs.has(latestPushJobId) ? serializePushJob(pushJobs.get(latestPushJobId)) : null,
       },
       baidupan: {
         enabled: values.BAIDUPAN_BACKUP_ENABLED === "true",
@@ -366,6 +502,55 @@ async function handle(request, reply) {
       return send(reply, 404, { message: "pull job not found" });
     }
     return send(reply, 200, { job: serializePullJob(job), jobId: job.id });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/actions/push-cache-object") {
+    const body = await readJsonBody(request);
+    const { values } = await readEnv();
+    const objectKey = normalizeObjectKey(body.objectKey);
+    if (!objectKey) {
+      return send(reply, 400, { message: "objectKey is required" });
+    }
+    const newWauleApiUrl = String(body.newWauleApiUrl || values.NEWWAULE_API_BASE_URL || "").replace(/\/+$/, "");
+    const cacheUploadBaseUrl = String(body.cacheUploadBaseUrl || values.NEWWAULE_CACHE_UPLOAD_BASE_URL || "").replace(/\/+$/, "");
+    const newWauleToken = String(body.token || values.NEWWAULE_HOME_MINIO_TOKEN || values.HOME_MINIO_WEB_TOKEN || "");
+    if (!newWauleApiUrl) {
+      return send(reply, 400, { message: "newWauleApiUrl is required" });
+    }
+    if (!newWauleToken) {
+      return send(reply, 400, { message: "token is required" });
+    }
+
+    const { job, alreadyRunning } = startPushJob({
+      objectKey,
+      newWauleApiUrl,
+      cacheUploadBaseUrl,
+      env: {
+        ...values,
+        NEWWAULE_API_BASE_URL: newWauleApiUrl,
+        ...(cacheUploadBaseUrl ? { NEWWAULE_CACHE_UPLOAD_BASE_URL: cacheUploadBaseUrl } : {}),
+        NEWWAULE_HOME_MINIO_TOKEN: newWauleToken,
+      },
+    });
+    return send(reply, 202, {
+      message: alreadyRunning ? "push job already running" : "push job queued",
+      job: serializePushJob(job),
+      jobId: job.id,
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/actions/push-cache-status") {
+    const objectKey = normalizeObjectKey(url.searchParams.get("objectKey"));
+    const jobId = url.searchParams.get("jobId") || latestPushJobId;
+    const job = objectKey
+      ? [...pushJobs.values()].reverse().find((candidate) => candidate.objectKey === objectKey)
+      : jobId
+        ? pushJobs.get(jobId)
+        : null;
+    if (!job) {
+      return send(reply, 404, { message: "push job not found" });
+    }
+    return send(reply, 200, { job: serializePushJob(job), jobId: job.id });
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/install-cron") {
