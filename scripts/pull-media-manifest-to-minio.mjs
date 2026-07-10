@@ -1,6 +1,9 @@
 import { createHash, createHmac } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { once } from "node:events";
 
 const rootDir = resolve(new URL("..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
@@ -72,21 +75,10 @@ function readInteger(value, fallback, { min, max }) {
   return Math.min(max, Math.max(min, parsed));
 }
 
-async function runConcurrent(items, concurrency, worker) {
-  const results = [];
-  let nextIndex = 0;
-  const workerCount = Math.min(concurrency, items.length);
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (true) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= items.length) return;
-        results[index] = await worker(items[index], index);
-      }
-    }),
-  );
-  return results;
+async function writeLine(stream, line) {
+  if (!stream.write(`${line.replace(/\n+$/, "")}\n`, "utf8")) {
+    await once(stream, "drain");
+  }
 }
 
 function formatAmzDate(date) {
@@ -286,46 +278,69 @@ async function main() {
   if (!dryRun) {
     await ensureBucket(minioClient);
   }
-  const manifest = await readFile(manifestPath, "utf8");
-  const records = manifest
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => JSON.parse(line))
-    .filter((record) => record.objectKey && recordSourceUrls(record).length > 0);
   const seenKeys = new Set();
-  const uniqueRecords = [];
-  for (const record of records) {
-    const key = String(record.objectKey || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
-    if (!key || seenKeys.has(key)) continue;
-    seenKeys.add(key);
-    uniqueRecords.push(record);
-  }
-
-  console.log(JSON.stringify({ dryRun, manifestPath, bucket, records: records.length, uniqueRecords: uniqueRecords.length, concurrency }, null, 2));
-
+  const active = new Set();
+  let records = 0;
+  let uniqueRecords = 0;
   let downloaded = 0;
   let skipped = 0;
   let failed = 0;
   let rejected = 0;
-  const failedRecords = [];
+  let failedPath = "";
+  let failedStream = null;
 
-  const results = await runConcurrent(uniqueRecords, concurrency, (record) => processRecord(record, { dryRun, minioClient }));
-  for (const result of results) {
+  async function writeFailedRecord(record) {
+    if (dryRun || !record) return;
+    if (!failedStream) {
+      failedPath = resolve(workDir, `failed-${Date.now()}.jsonl`);
+      await mkdir(dirname(failedPath), { recursive: true });
+      failedStream = createWriteStream(failedPath, { encoding: "utf8" });
+    }
+    await writeLine(failedStream, JSON.stringify(record));
+  }
+
+  async function consumeRecord(record) {
+    const result = await processRecord(record, { dryRun, minioClient });
     if (result?.status === "downloaded") downloaded += 1;
     if (result?.status === "skipped") skipped += 1;
     if (result?.status === "failed") failed += 1;
     if (result?.status === "rejected") rejected += 1;
-    if (result?.failedRecord) failedRecords.push(result.failedRecord);
+    if (result?.failedRecord) await writeFailedRecord(result.failedRecord);
   }
 
-  if (!dryRun && failedRecords.length > 0) {
-    const failedPath = resolve(workDir, `failed-${Date.now()}.jsonl`);
-    await mkdir(dirname(failedPath), { recursive: true });
-    await writeFile(failedPath, `${failedRecords.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+  const lineReader = createInterface({
+    input: createReadStream(manifestPath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+
+  for await (const rawLine of lineReader) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const record = JSON.parse(line);
+    if (!record.objectKey || recordSourceUrls(record).length === 0) continue;
+    records += 1;
+    const key = String(record.objectKey || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    uniqueRecords += 1;
+
+    const promise = consumeRecord(record).finally(() => {
+      active.delete(promise);
+    });
+    active.add(promise);
+    if (active.size >= concurrency) {
+      await Promise.race(active);
+    }
+  }
+
+  await Promise.all(active);
+  if (failedStream) {
+    failedStream.end();
+    await once(failedStream, "finish");
     console.error(`FAILED_RECORDS ${failedPath}`);
   }
 
+  console.log(JSON.stringify({ dryRun, manifestPath, bucket, records, uniqueRecords, concurrency }, null, 2));
   console.log(JSON.stringify({ downloaded, skipped, failed, rejected }, null, 2));
 }
 

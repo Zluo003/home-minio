@@ -1,8 +1,12 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
+import { StringDecoder } from "node:string_decoder";
 
 const rootDir = resolve(new URL("../..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
@@ -104,6 +108,50 @@ async function readJsonBody(request) {
   for await (const chunk of request) chunks.push(chunk);
   const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : {};
+}
+
+async function writeManifestRequestBody(request, manifestPath) {
+  const output = createWriteStream(manifestPath);
+  const decoder = new StringDecoder("utf8");
+  let manifestCount = 0;
+  let pending = "";
+  let lastEndedWithNewline = true;
+
+  try {
+    for await (const chunk of request) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const text = decoder.write(buffer);
+      if (!buffer.byteLength) continue;
+      lastEndedWithNewline = /\r?\n$/.test(text);
+      pending += text;
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim()) manifestCount += 1;
+      }
+      if (!output.write(buffer)) {
+        await once(output, "drain");
+      }
+    }
+
+    const tail = decoder.end();
+    if (tail) {
+      lastEndedWithNewline = /\r?\n$/.test(tail);
+      pending += tail;
+    }
+    if (pending.trim()) {
+      manifestCount += 1;
+    }
+    if (!lastEndedWithNewline) {
+      output.write("\n", "utf8");
+    }
+    output.end();
+    await finished(output);
+    return manifestCount;
+  } catch (error) {
+    output.destroy();
+    throw error;
+  }
 }
 
 function send(reply, statusCode, payload) {
@@ -473,17 +521,26 @@ async function handle(request, reply) {
       });
     }
 
-    const body = await readJsonBody(request);
-    const manifest = typeof body.manifest === "string" ? body.manifest.trim() : "";
-    if (!manifest) {
-      return send(reply, 400, { message: "manifest is required" });
-    }
-    const manifestCount = manifest.split(/\r?\n/).filter((line) => line.trim()).length;
-
     const { values } = await readEnv();
     const manifestPath = resolve(rootDir, values.MEDIA_PULL_MANIFEST_PATH || "./backup/newwaule-media-manifest.jsonl");
     await mkdir(dirname(manifestPath), { recursive: true });
-    await writeFile(manifestPath, `${manifest.replace(/\n+$/, "")}\n`, "utf8");
+    const contentType = String(request.headers["content-type"] || "").toLowerCase();
+    let manifestCount = 0;
+
+    if (contentType.includes("application/json")) {
+      const body = await readJsonBody(request);
+      const manifest = typeof body.manifest === "string" ? body.manifest.trim() : "";
+      if (!manifest) {
+        return send(reply, 400, { message: "manifest is required" });
+      }
+      manifestCount = manifest.split(/\r?\n/).filter((line) => line.trim()).length;
+      await writeFile(manifestPath, `${manifest.replace(/\n+$/, "")}\n`, "utf8");
+    } else {
+      manifestCount = await writeManifestRequestBody(request, manifestPath);
+      if (manifestCount <= 0) {
+        return send(reply, 400, { message: "manifest is required" });
+      }
+    }
     console.log(`[home-minio] saved uploaded manifest ${manifestPath} lines=${manifestCount}`);
 
     const { job } = startPullJob({ manifestPath, manifestCount });
