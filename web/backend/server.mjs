@@ -13,6 +13,7 @@ const envPath = resolve(rootDir, ".env");
 const port = Number(process.env.HOME_MINIO_WEB_API_PORT || 19090);
 const token = process.env.HOME_MINIO_WEB_TOKEN || "";
 const outputTailLimit = 12000;
+const pullProgressPrefix = "HOME_MINIO_PROGRESS ";
 const pullJobs = new Map();
 let latestPullJobId = "";
 const pushJobs = new Map();
@@ -178,6 +179,26 @@ function appendTail(current, chunk) {
   return next.length > outputTailLimit ? next.slice(-outputTailLimit) : next;
 }
 
+function applyPullProgress(job, chunk) {
+  job.progressBuffer += chunk;
+  const lines = job.progressBuffer.split(/\r?\n/);
+  job.progressBuffer = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.startsWith(pullProgressPrefix)) continue;
+    try {
+      const progress = JSON.parse(line.slice(pullProgressPrefix.length));
+      for (const key of ["processed", "downloaded", "skipped", "failed", "rejected", "records", "uniqueRecords"]) {
+        const value = Number(progress[key]);
+        if (Number.isFinite(value) && value >= 0) {
+          job[key] = Math.floor(value);
+        }
+      }
+    } catch {
+      // A malformed progress line stays in stdout for diagnostics.
+    }
+  }
+}
+
 function readInteger(value, fallback, { min, max }) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed)) return fallback;
@@ -223,6 +244,13 @@ function serializePullJob(job) {
     stdout: job.stdout,
     stderr: job.stderr,
     error: job.error,
+    processed: job.processed,
+    downloaded: job.downloaded,
+    skipped: job.skipped,
+    failed: job.failed,
+    rejected: job.rejected,
+    records: job.records,
+    uniqueRecords: job.uniqueRecords,
   };
 }
 
@@ -268,6 +296,14 @@ function startPullJob(meta = {}) {
     stdout: "",
     stderr: "",
     error: null,
+    processed: 0,
+    downloaded: 0,
+    skipped: 0,
+    failed: 0,
+    rejected: 0,
+    records: 0,
+    uniqueRecords: 0,
+    progressBuffer: "",
   };
   pullJobs.set(job.id, job);
   latestPullJobId = job.id;
@@ -281,6 +317,7 @@ function startPullJob(meta = {}) {
 
   child.stdout.on("data", (chunk) => {
     const text = chunk.toString();
+    applyPullProgress(job, text);
     job.stdout = appendTail(job.stdout, text);
     process.stdout.write(text);
   });
@@ -296,6 +333,7 @@ function startPullJob(meta = {}) {
     console.error(`[home-minio] pull job ${job.id} error: ${job.error}`);
   });
   child.on("close", (code) => {
+    applyPullProgress(job, "\n");
     job.code = code ?? 1;
     job.status = job.code === 0 ? "SUCCEEDED" : "FAILED";
     job.finishedAt = new Date().toISOString();

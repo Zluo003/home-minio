@@ -8,6 +8,8 @@ import { once } from "node:events";
 const rootDir = resolve(new URL("..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
 const emptyPayloadHash = createHash("sha256").update("").digest("hex");
+const progressPrefix = "HOME_MINIO_PROGRESS ";
+const progressIntervalMs = 500;
 
 function parseEnv(source) {
   const values = {};
@@ -288,6 +290,22 @@ async function main() {
   let rejected = 0;
   let failedPath = "";
   let failedStream = null;
+  let lastProgressAt = 0;
+
+  function emitProgress(force = false) {
+    const now = Date.now();
+    if (!force && now - lastProgressAt < progressIntervalMs) return;
+    lastProgressAt = now;
+    console.log(`${progressPrefix}${JSON.stringify({
+      processed: downloaded + skipped + failed + rejected,
+      downloaded,
+      skipped,
+      failed,
+      rejected,
+      records,
+      uniqueRecords,
+    })}`);
+  }
 
   async function writeFailedRecord(record) {
     if (dryRun || !record) return;
@@ -306,7 +324,10 @@ async function main() {
     if (result?.status === "failed") failed += 1;
     if (result?.status === "rejected") rejected += 1;
     if (result?.failedRecord) await writeFailedRecord(result.failedRecord);
+    emitProgress();
   }
+
+  emitProgress(true);
 
   const lineReader = createInterface({
     input: createReadStream(manifestPath, { encoding: "utf8" }),
@@ -340,6 +361,7 @@ async function main() {
     console.error(`FAILED_RECORDS ${failedPath}`);
   }
 
+  emitProgress(true);
   console.log(JSON.stringify({ dryRun, manifestPath, bucket, records, uniqueRecords, concurrency }, null, 2));
   console.log(JSON.stringify({ downloaded, skipped, failed, rejected }, null, 2));
 }
