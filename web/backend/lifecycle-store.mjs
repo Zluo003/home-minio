@@ -1,5 +1,5 @@
-import { createCipheriv, createDecipheriv, createHmac, createHash, randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createDecipheriv, createHash, randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
@@ -87,20 +87,9 @@ function canonicalOssConfig(input) {
   return { bucket, region, endpoint, accessKeyId, accessKeySecret, publicBaseUrl };
 }
 
-function encryptJson(value, key) {
-  if (!key) {
-    throw new LifecycleValidationError("Home MinIO lifecycle credential encryption is not configured.", 503);
-  }
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value), "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `v1.${iv.toString("base64url")}.${tag.toString("base64url")}.${ciphertext.toString("base64url")}`;
-}
-
 function decryptJson(value, key) {
   if (!key) {
-    throw new LifecycleValidationError("Home MinIO lifecycle credential encryption is not configured.", 503);
+    throw new LifecycleValidationError("旧版加密 OSS 配置需要原加密密钥才能恢复。", 500);
   }
   const [version, ivRaw, tagRaw, ciphertextRaw] = String(value || "").split(".");
   if (version !== "v1" || !ivRaw || !tagRaw || !ciphertextRaw) {
@@ -116,6 +105,29 @@ function decryptJson(value, key) {
     return JSON.parse(plaintext.toString("utf8"));
   } catch {
     throw new LifecycleValidationError("Stored OSS credentials cannot be decrypted with the configured master key.", 500);
+  }
+}
+
+function serializeConfigPayload(value) {
+  return `plain.${Buffer.from(JSON.stringify(value), "utf8").toString("base64url")}`;
+}
+
+function deserializeConfigPayload(value, legacyEncryptionKey) {
+  const payload = String(value || "");
+  if (payload.startsWith("plain.")) {
+    try {
+      return JSON.parse(Buffer.from(payload.slice("plain.".length), "base64url").toString("utf8"));
+    } catch {
+      throw new LifecycleValidationError("Stored OSS credential payload is invalid.", 500);
+    }
+  }
+  if (payload.startsWith("v1.")) {
+    return decryptJson(payload, legacyEncryptionKey);
+  }
+  try {
+    return JSON.parse(payload);
+  } catch {
+    throw new LifecycleValidationError("Stored OSS credential payload is invalid.", 500);
   }
 }
 
@@ -234,25 +246,58 @@ function serializeCachePushJob(row) {
 export class LifecycleStore {
   constructor(options = {}) {
     this.dbPath = resolve(options.dbPath || process.env.HOME_MINIO_STATE_DB || "./state/home-minio.sqlite");
-    this.encryptionKey = options.encryptionKey === undefined ? loadLifecycleEncryptionKey() : options.encryptionKey;
-    mkdirSync(dirname(this.dbPath), { recursive: true });
+    if (options.encryptionKey === undefined) {
+      try {
+        this.legacyEncryptionKey = loadLifecycleEncryptionKey();
+      } catch {
+        this.legacyEncryptionKey = null;
+      }
+    } else {
+      this.legacyEncryptionKey = options.encryptionKey;
+    }
+    mkdirSync(dirname(this.dbPath), { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dirname(this.dbPath), 0o700);
+    } catch {
+      // Some mounted filesystems do not support POSIX modes.
+    }
     this.db = new Database(this.dbPath);
+    this.secureStateFiles();
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
     this.migrate();
-    try {
-      this.verifyStoredCredentials();
-    } catch (error) {
-      this.db.close();
-      throw error;
-    }
+    this.migrateLegacyCredentialPayloads();
     this.recoverInterruptedWork();
+    this.secureStateFiles();
   }
 
-  verifyStoredCredentials() {
-    const row = this.db.prepare("SELECT encrypted_payload FROM oss_config_versions ORDER BY created_at LIMIT 1").get();
-    if (row && this.encryptionKey) decryptJson(row.encrypted_payload, this.encryptionKey);
+  secureStateFiles() {
+    for (const path of [this.dbPath, `${this.dbPath}-wal`, `${this.dbPath}-shm`]) {
+      if (!existsSync(path)) continue;
+      try {
+        chmodSync(path, 0o600);
+      } catch {
+        // Some mounted filesystems do not support POSIX modes.
+      }
+    }
+  }
+
+  migrateLegacyCredentialPayloads() {
+    if (!this.legacyEncryptionKey) return;
+    const rows = this.db.prepare(`
+      SELECT id, encrypted_payload
+      FROM oss_config_versions
+      WHERE encrypted_payload LIKE 'v1.%'
+    `).all();
+    if (!rows.length) return;
+    const update = this.db.prepare("UPDATE oss_config_versions SET encrypted_payload = ? WHERE id = ?");
+    const migrate = this.db.transaction(() => {
+      for (const row of rows) {
+        update.run(serializeConfigPayload(decryptJson(row.encrypted_payload, this.legacyEncryptionKey)), row.id);
+      }
+    });
+    migrate();
   }
 
   migrate() {
@@ -392,23 +437,27 @@ export class LifecycleStore {
         (SELECT COUNT(*) FROM transfer_items) AS items,
         (SELECT COUNT(*) FROM transfer_items WHERE status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')) AS active_items
     `).get();
+    const legacyEncryptedConfigs = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM oss_config_versions
+      WHERE encrypted_payload LIKE 'v1.%'
+    `).get().count;
     return {
-      ready: Boolean(this.encryptionKey),
+      ready: true,
       dbPath: this.dbPath,
       schemaVersion: SCHEMA_VERSION,
       jobs: counts.jobs,
       items: counts.items,
       activeItems: counts.active_items,
-      encryptionError: this.encryptionKey ? null : "HOME_MINIO_CONFIG_ENCRYPTION_KEY is not configured.",
+      credentialStorage: "LOCAL_SQLITE",
+      legacyEncryptedConfigs,
+      encryptionError: null,
     };
   }
 
   upsertConfigVersion(input) {
     const config = canonicalOssConfig(input);
-    if (!this.encryptionKey) {
-      throw new LifecycleValidationError("Home MinIO lifecycle credential encryption is not configured.", 503);
-    }
-    const fingerprint = createHmac("sha256", this.encryptionKey).update(JSON.stringify(config)).digest("hex");
+    const fingerprint = createHash("sha256").update(JSON.stringify(config)).digest("hex");
     const existing = this.db.prepare("SELECT * FROM oss_config_versions WHERE fingerprint = ?").get(fingerprint);
     if (existing) return serializeConfigVersion(existing);
 
@@ -421,7 +470,7 @@ export class LifecycleStore {
     `).run(
       id,
       fingerprint,
-      encryptJson(config, this.encryptionKey),
+      serializeConfigPayload(config),
       config.bucket,
       config.region,
       config.endpoint,
@@ -439,7 +488,7 @@ export class LifecycleStore {
   getDecryptedConfig(id) {
     const row = this.db.prepare("SELECT * FROM oss_config_versions WHERE id = ?").get(id);
     if (!row) throw new LifecycleValidationError("OSS config version not found.", 404);
-    return decryptJson(row.encrypted_payload, this.encryptionKey);
+    return deserializeConfigPayload(row.encrypted_payload, this.legacyEncryptionKey);
   }
 
   createJob(input) {

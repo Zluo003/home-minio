@@ -9,6 +9,7 @@ import { finished } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
 import { LifecycleStore } from "./lifecycle-store.mjs";
 import { LifecycleTransferService } from "./lifecycle-service.mjs";
+import { CONFIG_FIELDS, SECRET_CONFIG_KEYS } from "../frontend/config-schema.js";
 
 const rootDir = resolve(new URL("../..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
@@ -28,7 +29,7 @@ try {
   lifecycleStore = new LifecycleStore();
 } catch (error) {
   lifecycleStartupError = error instanceof Error ? error.message : String(error);
-  console.error(`[home-minio] lifecycle encryption initialization failed: ${lifecycleStartupError}`);
+  console.error(`[home-minio] lifecycle state initialization failed: ${lifecycleStartupError}`);
   lifecycleStore = new LifecycleStore({ encryptionKey: null });
 }
 let lifecycleService = null;
@@ -36,8 +37,6 @@ try {
   const lifecycleHealth = lifecycleStore.health();
   if (!lifecycleHealth.ready) {
     lifecycleStartupError = lifecycleStartupError || lifecycleHealth.encryptionError;
-  } else if (!token) {
-    lifecycleStartupError = "HOME_MINIO_WEB_TOKEN is required for lifecycle endpoints.";
   } else {
     lifecycleService = new LifecycleTransferService({ store: lifecycleStore, env: process.env });
     lifecycleService.start();
@@ -47,56 +46,8 @@ try {
   console.error(`[home-minio] lifecycle transfer service unavailable: ${lifecycleStartupError}`);
 }
 
-const editableKeys = [
-  "MINIO_ROOT_USER",
-  "MINIO_ROOT_PASSWORD",
-  "HOME_MINIO_BIND_ADDRESS",
-  "MINIO_API_PORT",
-  "MINIO_CONSOLE_PORT",
-  "MINIO_DATA_DIR",
-  "MINIO_BUCKET",
-  "MINIO_INTERNAL_ENDPOINT",
-  "MINIO_WAULE_ACCESS_KEY",
-  "MINIO_WAULE_SECRET_KEY",
-  "HOME_MINIO_WEB_API_PORT",
-  "HOME_MINIO_WEB_PORT",
-  "HOME_MINIO_WEB_TOKEN",
-  "HOME_MINIO_STATE_DB",
-  "HOME_MINIO_CONFIG_ENCRYPTION_KEY",
-  "HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE",
-  "HOME_MINIO_TRANSFER_WORK_DIR",
-  "HOME_MINIO_PUBLIC_ENDPOINT",
-  "HOME_MINIO_CONSOLE_PUBLIC_URL",
-  "NEWWAULE_API_BASE_URL",
-  "NEWWAULE_CACHE_UPLOAD_BASE_URL",
-  "NEWWAULE_HOME_MINIO_TOKEN",
-  "CACHE_PUSH_CONCURRENCY",
-  "MEDIA_PULL_MANIFEST_PATH",
-  "MEDIA_PULL_WORK_DIR",
-  "MEDIA_PULL_CONCURRENCY",
-  "OSS_FILE_CONCURRENCY",
-  "OSS_MULTIPART_CONCURRENCY",
-  "OSS_MAX_HTTP_CONCURRENCY",
-  "OSS_MULTIPART_THRESHOLD_BYTES",
-  "OSS_PART_SIZE_BYTES",
-  "BAIDUPAN_BACKUP_ENABLED",
-  "BAIDUPAN_TOOL",
-  "BAIDUPAN_REMOTE_DIR",
-  "BAIDUPAN_WORK_DIR",
-  "BAIDUPAN_CRON_SCHEDULE",
-  "BYPY_BIN",
-  "BAIDUPCS_BIN",
-  "BAIDUPCS_CONFIG_DIR",
-  "BAIDUPCS_MAX_PARALLEL",
-  "BAIDUPCS_UPLOAD_NORAPID",
-];
-const secretEditableKeys = new Set([
-  "MINIO_ROOT_PASSWORD",
-  "MINIO_WAULE_SECRET_KEY",
-  "HOME_MINIO_WEB_TOKEN",
-  "HOME_MINIO_CONFIG_ENCRYPTION_KEY",
-  "NEWWAULE_HOME_MINIO_TOKEN",
-]);
+const editableKeys = [...CONFIG_FIELDS.keys()];
+const secretEditableKeys = new Set(SECRET_CONFIG_KEYS);
 
 function sanitizeEditableValues(values) {
   return Object.fromEntries(
@@ -216,7 +167,7 @@ function send(reply, statusCode, payload) {
 
 function assertLifecycleReady() {
   const health = lifecycleStore.health();
-  if (!token || !health.ready || !lifecycleService) {
+  if (!health.ready || !lifecycleService) {
     const error = new Error(lifecycleStartupError || health.encryptionError || "Lifecycle transfer service is unavailable.");
     error.statusCode = 503;
     throw error;
@@ -646,7 +597,7 @@ async function handle(request, reply) {
       pullJob: latestPullJobId && pullJobs.has(latestPullJobId) ? serializePullJob(pullJobs.get(latestPullJobId)) : null,
       lifecycle: {
         ...lifecycleHealth,
-        ready: lifecycleHealth.ready && Boolean(token) && Boolean(lifecycleService),
+        ready: lifecycleHealth.ready && Boolean(lifecycleService),
         ...(lifecycleService ? { settings: lifecycleService.settings() } : {}),
         ...(lifecycleService ? { telemetry: lifecycleService.telemetry() } : {}),
         recentJobs: lifecycleStore.listRecentJobs(10),

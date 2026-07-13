@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Home MinIO 控制台</title>
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -13,14 +14,15 @@
           <p class="eyebrow">NewWaule Cold Media</p>
           <h1>Home MinIO 控制台</h1>
         </div>
-        <nav>
-          <a href="#status">状态</a>
-          <a href="#config">配置</a>
-          <a href="#newwaule">NewWaule</a>
-          <a href="#transfer">媒体传输</a>
-          <a href="#backup">备份</a>
+        <nav aria-label="控制台页面">
+          <button type="button" class="nav-link" data-page-target="overview">运行概览</button>
+          <button type="button" class="nav-link" data-page-target="storage">MinIO 存储</button>
+          <button type="button" class="nav-link" data-page-target="newwaule">NewWaule 连接</button>
+          <button type="button" class="nav-link" data-page-target="transfer">媒体传输</button>
+          <button type="button" class="nav-link" data-page-target="backup">备份与恢复</button>
+          <button type="button" class="nav-link" data-page-target="advanced">控制台设置</button>
         </nav>
-        <p class="hint">配置保存到 home-minio 服务器 `.env`。NewWaule 连接信息需要填到 NewWaule 管理后台。</p>
+        <p class="hint">所有配置都在当前页面保存。密码和令牌留空表示保持原值，不需要手工编辑服务器配置文件。</p>
       </aside>
 
       <section class="workspace">
@@ -32,63 +34,100 @@
           <button id="refreshButton">刷新</button>
         </header>
 
-        <section id="status" class="panel status-grid">
-          <div>
-            <span>MinIO</span>
-            <strong id="minioState">-</strong>
-          </div>
-          <div>
-            <span>百度网盘</span>
-            <strong id="baidupanState">-</strong>
-          </div>
-          <div>
-            <span>工具</span>
-            <strong id="toolState">-</strong>
-          </div>
-          <div>
-            <span>媒体生命周期</span>
-            <strong id="lifecycleState">-</strong>
-          </div>
-        </section>
-
-        <section id="config" class="panel">
-          <div class="section-head">
-            <h2>配置</h2>
-            <button id="saveButton">保存配置</button>
-          </div>
-          <form id="configForm" class="config-grid"></form>
-        </section>
-
-        <section id="newwaule" class="panel">
-          <div class="section-head">
-            <h2>NewWaule 后台配置</h2>
-            <button id="copyConfigButton">复制</button>
-          </div>
-          <pre id="newWauleConfig" class="output output--compact">等待读取。</pre>
-        </section>
-
-        <section id="transfer" class="panel">
-          <div class="section-head">
-            <h2>媒体传输</h2>
-          </div>
-          <pre id="transferStatus" class="output output--compact">等待读取。</pre>
-        </section>
-
-        <section id="backup" class="panel">
-          <div class="section-head">
-            <h2>备份与恢复</h2>
-            <div class="actions">
-              <button id="dryRunButton">备份演练</button>
-              <button id="backupButton">立即备份</button>
-              <button id="pullManifestDryRunButton">拉取演练</button>
-              <button id="pullManifestButton">按清单拉取</button>
-              <button id="installCronButton">保存自动备份</button>
-              <button id="showCronButton">查看计划</button>
-              <button id="restoreDryRunButton">恢复演练</button>
+        <section class="page" data-page="overview">
+          <div class="page-heading">
+            <div>
+              <p class="page-kicker">运行概览</p>
+              <h2>服务状态</h2>
             </div>
           </div>
-          <pre id="output" class="output">等待操作。</pre>
+          <section class="panel status-grid">
+            <div>
+              <span>MinIO</span>
+              <strong id="minioState">-</strong>
+            </div>
+            <div>
+              <span>百度网盘</span>
+              <strong id="baidupanState">-</strong>
+            </div>
+            <div>
+              <span>工具</span>
+              <strong id="toolState">-</strong>
+            </div>
+            <div>
+              <span>媒体生命周期</span>
+              <strong id="lifecycleState">-</strong>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h3>最近传输</h3>
+                <p>生命周期并发、吞吐和最近任务。</p>
+              </div>
+            </div>
+            <pre id="overviewTransferStatus" class="output output--compact">等待读取。</pre>
+          </section>
         </section>
+
+        <section class="page" data-page="storage" hidden>
+          <div class="config-page-slot" data-config-page="storage"></div>
+        </section>
+
+        <section class="page" data-page="newwaule" hidden>
+          <div class="config-page-slot" data-config-page="newwaule"></div>
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h3>NewWaule 后台填写值</h3>
+                <p>保存连接配置后，可将以下内容填入 NewWaule 的 Home MinIO 冷存储设置。</p>
+              </div>
+              <button id="copyConfigButton" type="button">复制</button>
+            </div>
+            <pre id="newWauleConfig" class="output output--compact">等待读取。</pre>
+          </section>
+        </section>
+
+        <section class="page" data-page="transfer" hidden>
+          <div class="config-page-slot" data-config-page="transfer"></div>
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h3>实时传输状态</h3>
+                <p>显示当前并发占用、吞吐和最近任务结果。</p>
+              </div>
+            </div>
+            <pre id="transferStatus" class="output output--compact">等待读取。</pre>
+          </section>
+        </section>
+
+        <section class="page" data-page="backup" hidden>
+          <div class="config-page-slot" data-config-page="backup"></div>
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h3>备份操作</h3>
+                <p>先执行演练，再运行正式备份或恢复。</p>
+              </div>
+              <div class="actions">
+                <button id="dryRunButton" type="button">备份演练</button>
+                <button id="backupButton" type="button">立即备份</button>
+                <button id="pullManifestDryRunButton" type="button">拉取演练</button>
+                <button id="pullManifestButton" type="button">按清单拉取</button>
+                <button id="installCronButton" type="button">保存自动备份</button>
+                <button id="showCronButton" type="button">查看计划</button>
+                <button id="restoreDryRunButton" type="button">恢复演练</button>
+              </div>
+            </div>
+            <pre id="output" class="output">等待操作。</pre>
+          </section>
+        </section>
+
+        <section class="page" data-page="advanced" hidden>
+          <div class="config-page-slot" data-config-page="advanced"></div>
+        </section>
+
+        <section id="globalMessage" class="toast" role="status" aria-live="polite" hidden></section>
       </section>
     </main>
     <script src="./app.js" type="module"></script>

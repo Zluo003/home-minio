@@ -14,11 +14,11 @@ Endpoint: http://100.x.y.z:19000
 ## Start
 
 ```bash
-cp .env.example .env
-# edit .env secrets first
-docker compose up -d
+docker compose up -d --build
 ./scripts/healthcheck.sh
 ```
+
+The stack can start without manually creating or editing `.env`. Open the Home MinIO console and complete configuration from the page. Docker-level fields marked `需重启` take effect after recreating the containers.
 
 Default ports are five digits to avoid common local-service conflicts:
 
@@ -43,22 +43,13 @@ Open the local management console:
 http://<home-server-ip>:19091
 ```
 
-The web console reads and updates `.env`, checks MinIO readiness, and can trigger Baidu Netdisk backup dry-runs or backups. If `HOME_MINIO_WEB_TOKEN` is set, the browser will ask for it on first use. Port, account, MinIO credential, and backup schedule changes require restarting compose:
+The web console is the configuration entry point. Settings are split into MinIO storage, NewWaule connection, media transfer, backup, and console pages; every field includes its purpose and restart requirement. Password and token fields use `留空不修改`. Port, account, and MinIO credential changes require restarting compose:
 
 ```bash
 docker compose up -d --force-recreate
 ```
 
-Lifecycle endpoints require both `HOME_MINIO_WEB_TOKEN` and a 32-byte AES-256-GCM master key. Docker Secret takes priority over the environment variable:
-
-```env
-HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE=/run/secrets/home_minio_config_encryption_key
-HOME_MINIO_CONFIG_ENCRYPTION_KEY_HOST_FILE=/root/secrets/home_minio_config_encryption_key
-# Allowed fallback: 64 hex characters, 32 raw bytes, or base64 that decodes to 32 bytes.
-HOME_MINIO_CONFIG_ENCRYPTION_KEY=
-```
-
-If neither source contains a valid key, the lifecycle API stays unavailable. OSS credentials are encrypted before SQLite persistence and are never returned by the API or printed in lifecycle errors.
+Lifecycle state and the OSS configuration received from NewWaule are stored only in the HomeServer SQLite database. The state directory and SQLite files use owner-only permissions. No additional encryption key or secret file is required, and credential values are never returned by the API or printed in lifecycle errors.
 
 Set the MinIO address that NewWaule should use. In production this is usually a Tailscale/WireGuard address reachable from the Hong Kong server:
 
@@ -90,7 +81,7 @@ Path Style: true
 缓存目录: storage/home-minio-cache
 NewWaule 公网 URL: https://api.example.com
 Home MinIO 管理 API: http://100.x.y.z:19090
-管理 API 令牌: HOME_MINIO_WEB_TOKEN
+管理 API 令牌: 与 Home MinIO 控制台 -> 控制台设置 -> 管理 API 令牌相同
 ```
 
 `NewWaule 公网 URL` is the public NewWaule API root. Migrated media URLs become:
@@ -112,12 +103,12 @@ home-minio lifecycle worker -> Aliyun OSS
 browser/user -> NewWaule /local-media/<objectKey>
 ```
 
-For cache push, keep these values in home-minio `.env` or pass them from NewWaule admin:
+Configure cache push on the `NewWaule 连接` page. These are page fields; users do not need to edit `.env`:
 
-```env
+```text
 NEWWAULE_API_BASE_URL=https://api.example.com
 NEWWAULE_CACHE_UPLOAD_BASE_URL=
-NEWWAULE_HOME_MINIO_TOKEN=HOME_MINIO_WEB_TOKEN
+NEWWAULE_HOME_MINIO_TOKEN=<与控制台设置页的管理 API 令牌相同>
 CACHE_PUSH_CONCURRENCY=4
 ```
 
@@ -149,16 +140,24 @@ node scripts/pull-media-manifest-to-minio.mjs
 
 `MEDIA_PULL_CONCURRENCY` controls how many files are downloaded and uploaded to MinIO at the same time. Start with `4`; if the home server, OSS/NewWaule source, and network are stable, `8` or `16` can improve throughput. The script streams each source URL directly into the MinIO bucket and only uses `MEDIA_PULL_WORK_DIR` for failed-record logs.
 
-After NewWaule has `Home MinIO 管理 API` and `管理 API 令牌` configured, use the two category-specific controls:
+After NewWaule has `Home MinIO 管理 API` and `管理 API 令牌` configured, local-to-OSS lifecycle transfers use the two category-specific controls:
 
 ```text
 管理后台 -> 系统设置 -> 上传媒体存储 -> 预览待处理 / 立即执行一次
 管理后台 -> 系统设置 -> 生成媒体存储 -> 预览待处理 / 立即执行一次
 ```
 
-The old global archive action is retired. Each new action submits at most 100 physical objects. NewWaule persists the run and Home job ID, while Home MinIO persists item state in SQLite so process restarts can resume safely.
+Each category action submits at most 100 physical objects. NewWaule persists the run and Home job ID, while Home MinIO persists item state in SQLite so process restarts can resume safely.
 
-Before each lifecycle batch, NewWaule sends the current OSS bucket, region, endpoint, AccessKey, secret, and optional CDN base URL. Home MinIO fingerprints the complete config, reuses an identical immutable version, encrypts credentials in SQLite, and pins running jobs to that version. Responses never contain plaintext secrets.
+Media that was stored directly in OSS can be moved to cold storage manually:
+
+```text
+管理后台 -> 系统设置 -> Home MinIO 冷存储 -> 手动归档 OSS 冷文件
+```
+
+This action includes only workflow uploads and generated media whose age has reached NewWaule's global `冷存储天数`. Home MinIO pulls each OSS/CDN source directly, verifies the local copy, and then NewWaule switches database references to `/local-media/{objectKey}` before deleting the matching OSS source. Avatars, invoices, director assets, tone/lighting assets, canvas style presets, templates, and ambiguous keys are excluded.
+
+Before each lifecycle batch, NewWaule sends the current OSS bucket, region, endpoint, AccessKey, secret, and optional CDN base URL. Home MinIO fingerprints the complete config, reuses an identical immutable version, stores it in the local owner-only SQLite database, and pins running jobs to that version. Responses never contain plaintext secrets.
 
 Default transfer tuning is:
 
@@ -179,7 +178,7 @@ For large archives, NewWaule uploads the manifest as `application/x-ndjson`; hom
 
 While a pull job is running, `/api/actions/pull-manifest-status` exposes in-memory `processed`, `downloaded`, `skipped`, `failed`, and `rejected` counters. The pull process emits a compact progress record at most twice per second, so NewWaule can update Admin progress without scanning MinIO or reading the manifest again.
 
-Legacy manifest OSS records are downloaded from the `sourceUrl` generated by NewWaule. New lifecycle jobs instead receive an encrypted, versioned Aliyun OSS configuration from NewWaule and upload warm media directly from Home MinIO to OSS. LOCAL records are downloaded from the NewWaule public `/local-media/<objectKey>` URL.
+Legacy manifest OSS records are downloaded from the `sourceUrl` generated by NewWaule. New lifecycle jobs receive a versioned Aliyun OSS configuration from NewWaule and upload warm media directly from Home MinIO to OSS. LOCAL records are downloaded from the NewWaule public `/local-media/<objectKey>` URL, so large file transfer uses the NewWaule public network path rather than Tailscale.
 
 If old database rows still point to OSS objects that were already deleted, those rows will return `404`. The pull script records them in `MEDIA_PULL_WORK_DIR/failed-*.jsonl` and still uploads every successfully downloaded file into MinIO, so stale rows do not block valid media from being archived. After pull finishes, update NewWaule database without downloading files through the Hong Kong server:
 
@@ -267,7 +266,7 @@ Baidu Netdisk stores:
 /NewWaule/home-minio/<bucket>/gateway-media/2026/07/03/example.mp4
 ```
 
-Enable backup in `.env`:
+Open `备份与恢复` in the Home MinIO console and configure:
 
 ```env
 BAIDUPAN_BACKUP_ENABLED=true

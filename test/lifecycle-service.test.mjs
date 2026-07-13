@@ -108,7 +108,7 @@ async function setupService({
   maxHttpConcurrency = 16,
 }) {
   const root = await mkdtemp(join(tmpdir(), "home-minio-service-"));
-  const store = new LifecycleStore({ dbPath: join(root, "state.sqlite"), encryptionKey: Buffer.alloc(32, 9) });
+  const store = new LifecycleStore({ dbPath: join(root, "state.sqlite"), encryptionKey: null });
   const minio = new FakeMinioClient();
   const ossObjects = new Map();
   const ossMetadata = new Map();

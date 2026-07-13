@@ -8,11 +8,11 @@ services:
       - path: .env
         required: false
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-change-me-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-long-password}
     ports:
-      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${MINIO_API_PORT:-9000}:9000"
-      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${MINIO_API_PORT:-19000}:9000"
+      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${MINIO_CONSOLE_PORT:-19001}:9001"
     volumes:
       - ${MINIO_DATA_DIR:-./data}:/data
     healthcheck:
@@ -30,6 +30,12 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-change-me-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-long-password}
+      MINIO_BUCKET: ${MINIO_BUCKET:-waule-media}
+      MINIO_WAULE_ACCESS_KEY: ${MINIO_WAULE_ACCESS_KEY:-waule-newwaule}
+      MINIO_WAULE_SECRET_KEY: ${MINIO_WAULE_SECRET_KEY:-change-me-minio-secret}
     entrypoint: ["/bin/sh", "/scripts/init-minio.sh"]
     volumes:
       - ./scripts:/scripts:ro
@@ -46,11 +52,13 @@ services:
         required: false
     environment:
       HOME_MINIO_WEB_API_PORT: ${HOME_MINIO_WEB_API_PORT:-19090}
-      HOME_MINIO_WEB_TOKEN: ${HOME_MINIO_WEB_TOKEN}
+      HOME_MINIO_WEB_TOKEN: ${HOME_MINIO_WEB_TOKEN:-}
       HOME_MINIO_STATE_DB: ${HOME_MINIO_STATE_DB:-/data/state/home-minio.sqlite}
-      HOME_MINIO_CONFIG_ENCRYPTION_KEY: ${HOME_MINIO_CONFIG_ENCRYPTION_KEY:-}
-      HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE: ${HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE:-/run/secrets/home_minio_config_encryption_key}
       HOME_MINIO_TRANSFER_WORK_DIR: ${HOME_MINIO_TRANSFER_WORK_DIR:-/data/transfer-work}
+      MINIO_INTERNAL_ENDPOINT: ${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
+      MINIO_BUCKET: ${MINIO_BUCKET:-waule-media}
+      MINIO_WAULE_ACCESS_KEY: ${MINIO_WAULE_ACCESS_KEY:-waule-newwaule}
+      MINIO_WAULE_SECRET_KEY: ${MINIO_WAULE_SECRET_KEY:-change-me-minio-secret}
     command: ["node", "/app/web/backend/server.mjs"]
     ports:
       - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${HOME_MINIO_WEB_API_PORT:-19090}:${HOME_MINIO_WEB_API_PORT:-19090}"
@@ -63,9 +71,6 @@ services:
       - /root/.bypy:/root/.bypy
       - ${BAIDUPCS_CONFIG_DIR:-/root/.config/BaiduPCS-Go}:/root/.config/BaiduPCS-Go
       - /var/run/docker.sock:/var/run/docker.sock
-    secrets:
-      - source: home_minio_config_encryption_key
-        target: home_minio_config_encryption_key
 
   web:
     image: nginx:1.27-alpine
@@ -97,7 +102,3 @@ services:
       - /root/.bypy:/root/.bypy
       - ${BAIDUPCS_CONFIG_DIR:-/root/.config/BaiduPCS-Go}:/root/.config/BaiduPCS-Go
       - /var/run/docker.sock:/var/run/docker.sock
-
-secrets:
-  home_minio_config_encryption_key:
-    file: ${HOME_MINIO_CONFIG_ENCRYPTION_KEY_HOST_FILE:-/dev/null}

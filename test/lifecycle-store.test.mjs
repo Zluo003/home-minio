@@ -1,22 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createCipheriv, randomBytes } from "node:crypto";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   LifecycleConflictError,
   LifecycleStore,
-  LifecycleValidationError,
-  loadLifecycleEncryptionKey,
 } from "../web/backend/lifecycle-store.mjs";
 
 async function withStore(callback) {
   const root = await mkdtemp(join(tmpdir(), "home-minio-store-"));
   const dbPath = join(root, "state.sqlite");
-  const key = Buffer.alloc(32, 7);
-  const store = new LifecycleStore({ dbPath, encryptionKey: key });
+  const store = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    await callback({ store, dbPath, key });
+    await callback({ store, dbPath });
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });
@@ -32,7 +30,14 @@ const ossConfig = {
   publicBaseUrl: "https://cdn.example.test",
 };
 
-test("OSS config versions reuse an HMAC fingerprint and never expose the secret", async () => {
+function encryptLegacyConfig(value, key) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value), "utf8"), cipher.final()]);
+  return `v1.${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${ciphertext.toString("base64url")}`;
+}
+
+test("OSS config versions reuse a content fingerprint and never expose the secret through the API", async () => {
   await withStore(({ store }) => {
     const first = store.upsertConfigVersion(ossConfig);
     const second = store.upsertConfigVersion({ ...ossConfig });
@@ -42,7 +47,7 @@ test("OSS config versions reuse an HMAC fingerprint and never expose the secret"
     assert.equal("accessKeySecret" in first, false);
     assert.deepEqual(store.getDecryptedConfig(first.id), ossConfig);
     const raw = store.db.prepare("SELECT encrypted_payload FROM oss_config_versions WHERE id = ?").get(first.id);
-    assert.equal(raw.encrypted_payload.includes(ossConfig.accessKeySecret), false);
+    assert.match(raw.encrypted_payload, /^plain\./);
   });
 });
 
@@ -54,55 +59,51 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
   });
 });
 
-test("Docker secret encryption key takes priority and invalid key material is rejected", async () => {
-  const root = await mkdtemp(join(tmpdir(), "home-minio-secret-"));
-  const keyPath = join(root, "lifecycle-key");
+test("lifecycle state reopens without an external encryption key", async () => {
+  const root = await mkdtemp(join(tmpdir(), "home-minio-key-"));
+  const dbPath = join(root, "state.sqlite");
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
+  const version = first.upsertConfigVersion(ossConfig);
+  first.close();
+
+  const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    await writeFile(keyPath, "11".repeat(32), "utf8");
-    assert.deepEqual(
-      loadLifecycleEncryptionKey({
-        HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE: keyPath,
-        HOME_MINIO_CONFIG_ENCRYPTION_KEY: "invalid-fallback",
-      }),
-      Buffer.alloc(32, 0x11),
-    );
-    assert.throws(
-      () => loadLifecycleEncryptionKey({ HOME_MINIO_CONFIG_ENCRYPTION_KEY: "too-short" }),
-      LifecycleValidationError,
-    );
-    await writeFile(keyPath, "too-short", "utf8");
-    assert.throws(
-      () => loadLifecycleEncryptionKey({ HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE: keyPath }),
-      LifecycleValidationError,
-    );
-    await writeFile(keyPath, "", "utf8");
-    assert.deepEqual(
-      loadLifecycleEncryptionKey({
-        HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE: keyPath,
-        HOME_MINIO_CONFIG_ENCRYPTION_KEY: "22".repeat(32),
-      }),
-      Buffer.alloc(32, 0x22),
-    );
+    assert.deepEqual(second.getDecryptedConfig(version.id), ossConfig);
+    assert.equal(second.health().ready, true);
+    assert.equal(second.health().credentialStorage, "LOCAL_SQLITE");
   } finally {
+    second.close();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("a different master key cannot decrypt stored OSS credentials", async () => {
-  const root = await mkdtemp(join(tmpdir(), "home-minio-key-"));
+test("legacy encrypted OSS config rows migrate to local SQLite storage when the old key is available", async () => {
+  const root = await mkdtemp(join(tmpdir(), "home-minio-legacy-key-"));
   const dbPath = join(root, "state.sqlite");
-  const first = new LifecycleStore({ dbPath, encryptionKey: Buffer.alloc(32, 1) });
+  const key = Buffer.alloc(32, 5);
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
   const version = first.upsertConfigVersion(ossConfig);
+  first.db.prepare("UPDATE oss_config_versions SET encrypted_payload = ? WHERE id = ?")
+    .run(encryptLegacyConfig(ossConfig, key), version.id);
   first.close();
 
+  const second = new LifecycleStore({ dbPath, encryptionKey: key });
   try {
-    assert.throws(
-      () => new LifecycleStore({ dbPath, encryptionKey: Buffer.alloc(32, 2) }),
-      LifecycleValidationError,
-    );
+    const raw = second.db.prepare("SELECT encrypted_payload FROM oss_config_versions WHERE id = ?").get(version.id);
+    assert.match(raw.encrypted_payload, /^plain\./);
+    assert.deepEqual(second.getDecryptedConfig(version.id), ossConfig);
+    assert.equal(second.health().legacyEncryptedConfigs, 0);
   } finally {
+    second.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("SQLite lifecycle state files use owner-only permissions", async () => {
+  await withStore(async ({ dbPath }) => {
+    const metadata = await stat(dbPath);
+    assert.equal(metadata.mode & 0o777, 0o600);
+  });
 });
 
 test("lifecycle jobs are idempotent and reject job id reuse with different data", async () => {
@@ -136,8 +137,7 @@ test("lifecycle jobs are idempotent and reject job id reuse with different data"
 test("RUNNING jobs and items recover to retryable state after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "home-minio-recovery-"));
   const dbPath = join(root, "state.sqlite");
-  const key = Buffer.alloc(32, 3);
-  const first = new LifecycleStore({ dbPath, encryptionKey: key });
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
   const job = first.createJob({
     id: "run-recovery",
     mediaKind: "WORKFLOW_UPLOAD",
@@ -152,7 +152,7 @@ test("RUNNING jobs and items recover to retryable state after restart", async ()
   first.claimItem(job.items[0].id);
   first.close();
 
-  const second = new LifecycleStore({ dbPath, encryptionKey: key });
+  const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
     const recovered = second.getJob(job.id);
     assert.equal(recovered.status, "QUEUED");

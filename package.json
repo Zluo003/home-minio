@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node web/backend/server.mjs",
-    "check": "node --check web/backend/server.mjs && node --check web/backend/lifecycle-store.mjs && node --check web/backend/lifecycle-service.mjs",
+    "check": "node --check web/backend/server.mjs && node --check web/backend/lifecycle-store.mjs && node --check web/backend/lifecycle-service.mjs && node --check web/frontend/config-schema.js && node --check web/frontend/app.js",
     "test": "node --test test/**/*.test.mjs"
   },
   "dependencies": {
