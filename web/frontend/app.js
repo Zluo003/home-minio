@@ -35,6 +35,7 @@ async function api(path, options = {}) {
 const labels = {
   MINIO_ROOT_USER: "MinIO 管理员",
   MINIO_ROOT_PASSWORD: "MinIO 管理员密码",
+  HOME_MINIO_BIND_ADDRESS: "宿主机绑定地址",
   MINIO_API_PORT: "MinIO API 端口",
   MINIO_CONSOLE_PORT: "MinIO Console 端口",
   MINIO_DATA_DIR: "MinIO 数据目录",
@@ -45,6 +46,10 @@ const labels = {
   HOME_MINIO_WEB_API_PORT: "管理后端端口",
   HOME_MINIO_WEB_PORT: "管理前端端口",
   HOME_MINIO_WEB_TOKEN: "管理控制台令牌",
+  HOME_MINIO_STATE_DB: "SQLite 状态数据库",
+  HOME_MINIO_CONFIG_ENCRYPTION_KEY: "OSS 凭据加密主密钥",
+  HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE: "主密钥 Docker Secret",
+  HOME_MINIO_TRANSFER_WORK_DIR: "Multipart 临时目录",
   HOME_MINIO_PUBLIC_ENDPOINT: "MinIO 访问地址",
   HOME_MINIO_CONSOLE_PUBLIC_URL: "MinIO 控制台地址",
   NEWWAULE_API_BASE_URL: "NewWaule API 公网地址",
@@ -54,6 +59,11 @@ const labels = {
   MEDIA_PULL_MANIFEST_PATH: "媒体拉取清单",
   MEDIA_PULL_WORK_DIR: "媒体拉取工作目录",
   MEDIA_PULL_CONCURRENCY: "媒体拉取并发",
+  OSS_FILE_CONCURRENCY: "OSS 文件并发",
+  OSS_MULTIPART_CONCURRENCY: "大文件分片并发",
+  OSS_MAX_HTTP_CONCURRENCY: "全局 HTTP 并发",
+  OSS_MULTIPART_THRESHOLD_BYTES: "Multipart 阈值（字节）",
+  OSS_PART_SIZE_BYTES: "Multipart 分片大小（字节）",
   BAIDUPAN_BACKUP_ENABLED: "启用百度网盘备份",
   BAIDUPAN_TOOL: "百度网盘工具",
   BAIDUPAN_REMOTE_DIR: "百度网盘目录",
@@ -66,9 +76,10 @@ const labels = {
   BAIDUPCS_UPLOAD_NORAPID: "跳过秒传",
 };
 
-const secretKeys = new Set(["MINIO_ROOT_PASSWORD", "MINIO_WAULE_SECRET_KEY", "HOME_MINIO_WEB_TOKEN", "NEWWAULE_HOME_MINIO_TOKEN"]);
+const secretKeys = new Set(["MINIO_ROOT_PASSWORD", "MINIO_WAULE_SECRET_KEY", "HOME_MINIO_WEB_TOKEN", "HOME_MINIO_CONFIG_ENCRYPTION_KEY", "NEWWAULE_HOME_MINIO_TOKEN"]);
 
-function renderForm(values, keys) {
+function renderForm(values, keys, configuredKeys = []) {
+  const configured = new Set(configuredKeys);
   form.innerHTML = keys.map((key) => {
     const value = values[key] ?? "";
     if (key === "BAIDUPAN_BACKUP_ENABLED") {
@@ -78,13 +89,14 @@ function renderForm(values, keys) {
       return `<label><span>${labels[key] || key}</span><select name="${key}"><option value="baidupcs" ${value !== "bypy" ? "selected" : ""}>baidupcs</option><option value="bypy" ${value === "bypy" ? "selected" : ""}>bypy</option></select></label>`;
     }
     const type = secretKeys.has(key) ? "password" : "text";
-    return `<label><span>${labels[key] || key}</span><input type="${type}" name="${key}" value="${String(value).replaceAll('"', "&quot;")}" /></label>`;
+    const placeholder = secretKeys.has(key) && configured.has(key) ? "已配置，留空不修改" : "";
+    return `<label><span>${labels[key] || key}</span><input type="${type}" name="${key}" value="${String(value).replaceAll('"', "&quot;")}" placeholder="${placeholder}" /></label>`;
   }).join("");
 }
 
 async function loadConfig() {
   const data = await api("/api/config");
-  renderForm(data.values, data.editableKeys);
+  renderForm(data.values, data.editableKeys, data.configuredKeys);
 }
 
 async function loadStatus() {
@@ -96,6 +108,27 @@ async function loadStatus() {
   document.getElementById("toolState").textContent = status.cachePush?.latestJob
     ? `push ${status.cachePush.latestJob.status} · ${status.cachePush.concurrency}`
     : `${status.baidupan.tool} · ${status.baidupan.cronSchedule}`;
+  document.getElementById("lifecycleState").textContent = status.lifecycle?.ready
+    ? `${status.lifecycle.activeItems} 处理中 · ${status.lifecycle.jobs} 批次`
+    : status.lifecycle?.startupError || status.lifecycle?.encryptionError || "未就绪";
+  const lifecycleSettings = status.lifecycle?.settings || {};
+  const lifecycleTelemetry = status.lifecycle?.telemetry || {};
+  const recentJobs = Array.isArray(status.lifecycle?.recentJobs) ? status.lifecycle.recentJobs : [];
+  document.getElementById("transferStatus").textContent = [
+    `状态：${status.lifecycle?.ready ? "ready" : "unavailable"}`,
+    `拉取并发：${lifecycleSettings.pullConcurrency ?? "-"}`,
+    `OSS 文件并发：${lifecycleSettings.ossFileConcurrency ?? "-"}`,
+    `Multipart 并发：${lifecycleSettings.multipartConcurrency ?? "-"}`,
+    `全局 HTTP 并发：${lifecycleSettings.maxHttpConcurrency ?? "-"}`,
+    `Multipart 阈值：${lifecycleSettings.multipartThresholdBytes ?? "-"}`,
+    `分片大小：${lifecycleSettings.partSizeBytes ?? "-"}`,
+    `当前活跃对象：${lifecycleTelemetry.activeObjects ?? 0}`,
+    `当前 HTTP 占用：${lifecycleTelemetry.activeHttpRequests ?? 0}/${lifecycleSettings.maxHttpConcurrency ?? "-"}`,
+    `60 秒吞吐：${Math.round(lifecycleTelemetry.throughputBytesPerSecond ?? 0)} bytes/s`,
+    "",
+    "最近任务：",
+    ...recentJobs.map((job) => `${job.id} · ${job.mediaKind} · ${job.status} · ${job.succeededCount}/${job.totalCount} · ${job.processedBytes} bytes`),
+  ].join("\n");
   const configText = Object.entries(status.newWauleConfig)
     .map(([key, value]) => `${key}: ${value}`)
     .join("\n");

@@ -1,0 +1,16 @@
+{
+  "name": "home-minio",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node web/backend/server.mjs",
+    "check": "node --check web/backend/server.mjs && node --check web/backend/lifecycle-store.mjs && node --check web/backend/lifecycle-service.mjs",
+    "test": "node --test test/**/*.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1078.0",
+    "ali-oss": "^6.23.0",
+    "better-sqlite3": "^12.2.0"
+  }
+}

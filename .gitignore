@@ -1,5 +1,8 @@
 .env
 data/
 backup/
+node_modules/
+state/
+transfer-work/
 *.log
 .bypy/

@@ -1,0 +1,632 @@
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import {
+  CreateBucketCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import OSS from "ali-oss";
+import { LifecycleValidationError } from "./lifecycle-store.mjs";
+
+const MAX_ATTEMPTS = 10;
+const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+
+function readInteger(value, fallback, { min, max }) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+function normalizeEtag(value) {
+  return typeof value === "string" ? value.replace(/^"|"$/g, "") : null;
+}
+
+function encodeObjectKey(key) {
+  return key.split("/").map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
+
+function decodePathname(pathname) {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
+
+export function redactLifecycleMessage(message, sensitiveValues = []) {
+  let redacted = String(message || "");
+  for (const value of sensitiveValues) {
+    const secret = String(value || "");
+    if (secret.length >= 4) redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted
+    .replace(/\b(access[-_ ]?key(?:id|secret)?|authorization|secret(?:access)?key|token|password)\b\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .slice(0, 4000);
+}
+
+export function sourceUrlMatchesObjectKey(sourceUrl, objectKey) {
+  try {
+    const url = new URL(sourceUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    const path = decodePathname(url.pathname).replace(/^\/+/, "");
+    const candidate = path.startsWith("local-media/") ? path.slice("local-media/".length) : path;
+    return candidate === objectKey || candidate.endsWith(`/${objectKey}`);
+  } catch {
+    return false;
+  }
+}
+
+function nodeReadable(body) {
+  if (!body) throw new Error("Object response body is empty.");
+  if (body instanceof Readable) return body;
+  if (typeof body.transformToWebStream === "function") {
+    return Readable.fromWeb(body.transformToWebStream());
+  }
+  if (typeof body[Symbol.asyncIterator] === "function") return Readable.from(body);
+  throw new Error("Object response body is not readable.");
+}
+
+class Semaphore {
+  constructor(limit) {
+    this.limit = Math.max(1, limit);
+    this.active = 0;
+    this.waiters = [];
+  }
+
+  drain() {
+    for (let index = 0; index < this.waiters.length;) {
+      const waiter = this.waiters[index];
+      if (this.active + waiter.weight > this.limit) {
+        index += 1;
+        continue;
+      }
+      this.waiters.splice(index, 1);
+      this.active += waiter.weight;
+      waiter.resolve();
+    }
+  }
+
+  async use(callback, requestedWeight = 1) {
+    const weight = Math.max(1, Math.min(this.limit, requestedWeight));
+    if (this.active + weight > this.limit || this.waiters.length > 0) {
+      await new Promise((resolveWaiter) => {
+        this.waiters.push({ weight, resolve: resolveWaiter });
+        this.drain();
+      });
+    } else {
+      this.active += weight;
+    }
+    try {
+      return await callback();
+    } finally {
+      this.active -= weight;
+      this.drain();
+    }
+  }
+}
+
+function createMinioClient(env) {
+  const accessKeyId = env.MINIO_WAULE_ACCESS_KEY || env.MINIO_ROOT_USER;
+  const secretAccessKey = env.MINIO_WAULE_SECRET_KEY || env.MINIO_ROOT_PASSWORD;
+  if (!accessKeyId || !secretAccessKey) {
+    throw new LifecycleValidationError("MinIO credentials are not configured.", 503);
+  }
+  return new S3Client({
+    endpoint: env.MINIO_INTERNAL_ENDPOINT || "http://minio:9000",
+    region: env.MINIO_REGION || "us-east-1",
+    forcePathStyle: true,
+    credentials: { accessKeyId, secretAccessKey },
+  });
+}
+
+function createOssClient(config) {
+  const endpoint = config.endpoint.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  return new OSS({
+    region: config.region.startsWith("oss-") ? config.region : `oss-${config.region}`,
+    endpoint: `https://${endpoint}`,
+    accessKeyId: config.accessKeyId,
+    accessKeySecret: config.accessKeySecret,
+    bucket: config.bucket,
+    secure: true,
+    timeout: "30m",
+    retryMax: 3,
+  });
+}
+
+function buildDirectOssUrl(config, objectKey) {
+  const endpoint = config.endpoint.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  const host = endpoint.startsWith(`${config.bucket}.`) ? endpoint : `${config.bucket}.${endpoint}`;
+  return `https://${host}/${encodeObjectKey(objectKey)}`;
+}
+
+async function hashFile(filePath) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+export class LifecycleTransferService {
+  constructor(options) {
+    this.store = options.store;
+    this.env = options.env || process.env;
+    this.fetch = options.fetchImpl || globalThis.fetch;
+    this.minioClient = options.minioClient || createMinioClient(this.env);
+    this.ossClientFactory = options.ossClientFactory || createOssClient;
+    this.bucket = this.env.MINIO_BUCKET || "waule-media";
+    this.workDir = resolve(this.env.HOME_MINIO_TRANSFER_WORK_DIR || "./transfer-work");
+    this.pullConcurrency = readInteger(this.env.MEDIA_PULL_CONCURRENCY, 4, { min: 1, max: 32 });
+    this.ossFileConcurrency = readInteger(this.env.OSS_FILE_CONCURRENCY, 8, { min: 1, max: 32 });
+    this.multipartConcurrency = readInteger(this.env.OSS_MULTIPART_CONCURRENCY, 4, { min: 1, max: 16 });
+    this.maxHttpConcurrency = readInteger(this.env.OSS_MAX_HTTP_CONCURRENCY, 16, { min: 1, max: 64 });
+    this.multipartThresholdBytes = readInteger(this.env.OSS_MULTIPART_THRESHOLD_BYTES, 64 * 1024 * 1024, { min: 5 * 1024 * 1024, max: 5 * 1024 * 1024 * 1024 });
+    this.partSizeBytes = readInteger(this.env.OSS_PART_SIZE_BYTES, 16 * 1024 * 1024, { min: 100 * 1024, max: 1024 * 1024 * 1024 });
+    this.pullSemaphore = new Semaphore(this.pullConcurrency);
+    this.ossSemaphore = new Semaphore(this.ossFileConcurrency);
+    this.workerSemaphore = new Semaphore(this.maxHttpConcurrency);
+    this.httpSemaphore = new Semaphore(this.maxHttpConcurrency);
+    this.activeItemIds = new Set();
+    this.activeObjectKeys = new Set();
+    this.byteSamples = [];
+    this.timer = null;
+    this.stopped = true;
+    this.bucketReadyPromise = null;
+  }
+
+  settings() {
+    return {
+      pullConcurrency: this.pullConcurrency,
+      ossFileConcurrency: this.ossFileConcurrency,
+      multipartConcurrency: this.multipartConcurrency,
+      maxHttpConcurrency: this.maxHttpConcurrency,
+      multipartThresholdBytes: this.multipartThresholdBytes,
+      partSizeBytes: this.partSizeBytes,
+    };
+  }
+
+  recordTransferredBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return;
+    const now = Date.now();
+    this.byteSamples.push({ at: now, bytes });
+    this.byteSamples = this.byteSamples.filter((sample) => sample.at >= now - 60_000);
+  }
+
+  telemetry() {
+    const now = Date.now();
+    this.byteSamples = this.byteSamples.filter((sample) => sample.at >= now - 60_000);
+    const transferredBytesLastMinute = this.byteSamples.reduce((sum, sample) => sum + sample.bytes, 0);
+    const oldestAt = this.byteSamples[0]?.at ?? now;
+    const elapsedSeconds = Math.max(1, Math.min(60, (now - oldestAt) / 1000));
+    return {
+      activeItems: this.activeItemIds.size,
+      activeObjects: this.activeObjectKeys.size,
+      activeHttpRequests: this.httpSemaphore.active,
+      transferredBytesLastMinute,
+      throughputBytesPerSecond: transferredBytesLastMinute / elapsedSeconds,
+    };
+  }
+
+  async ensureBucket() {
+    if (!this.bucketReadyPromise) {
+      this.bucketReadyPromise = this.httpSemaphore.use(async () => {
+        try {
+          await this.minioClient.send(new HeadBucketCommand({ Bucket: this.bucket }));
+        } catch (error) {
+          const status = error?.$metadata?.httpStatusCode;
+          if (status !== 404 && error?.name !== "NotFound" && error?.name !== "NoSuchBucket") throw error;
+          await this.minioClient.send(new CreateBucketCommand({ Bucket: this.bucket }));
+        }
+      });
+    }
+    return this.bucketReadyPromise;
+  }
+
+  start() {
+    if (!this.stopped) return;
+    this.stopped = false;
+    void this.kick();
+    this.timer = setInterval(() => void this.kick(), 10_000);
+    this.timer.unref?.();
+  }
+
+  async stop() {
+    this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    while (this.activeItemIds.size > 0) await delay(50);
+    this.minioClient.destroy?.();
+  }
+
+  async kick() {
+    if (this.stopped) return;
+    const available = Math.max(0, this.maxHttpConcurrency - this.activeItemIds.size);
+    if (!available) return;
+    const runnable = this.store.listRunnableItems(available * 2);
+    for (const candidate of runnable) {
+      if (
+        this.activeItemIds.has(candidate.id) ||
+        this.activeObjectKeys.has(candidate.objectKey) ||
+        this.activeItemIds.size >= this.maxHttpConcurrency
+      ) continue;
+      this.activeItemIds.add(candidate.id);
+      this.activeObjectKeys.add(candidate.objectKey);
+      void this.workerSemaphore.use(() => this.processItem(candidate.id))
+        .catch((error) => console.error(`[home-minio] lifecycle item ${candidate.id} failed: ${error instanceof Error ? error.message : String(error)}`))
+        .finally(() => {
+          this.activeItemIds.delete(candidate.id);
+          this.activeObjectKeys.delete(candidate.objectKey);
+          if (!this.stopped) queueMicrotask(() => void this.kick());
+        });
+    }
+  }
+
+  async submitJob(payload) {
+    const job = this.store.createJob(payload);
+    if (!this.stopped) void this.kick();
+    return job;
+  }
+
+  getJob(id) {
+    return this.store.getJob(id);
+  }
+
+  async headHomeObject(objectKey) {
+    return this.httpSemaphore.use(async () => {
+      try {
+        const result = await this.minioClient.send(new HeadObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+        return {
+          sizeBytes: Number(result.ContentLength ?? 0),
+          etag: normalizeEtag(result.ETag),
+          sha256: result.Metadata?.sha256 || null,
+        };
+      } catch (error) {
+        const status = error?.$metadata?.httpStatusCode;
+        if (status === 404 || error?.name === "NotFound" || error?.name === "NoSuchKey") return null;
+        throw error;
+      }
+    });
+  }
+
+  async copySourceToHome(item) {
+    await this.ensureBucket();
+    const existing = await this.headHomeObject(item.objectKey);
+    if (existing) {
+      const expectedHomeSize = item.expectedSizeBytes ?? item.home?.sizeBytes ?? null;
+      const expectedHomeSha256 = item.expectedSha256 || item.home?.sha256 || null;
+      const hasVerificationEvidence = expectedHomeSize !== null || Boolean(expectedHomeSha256);
+      const sizeMatches = expectedHomeSize === null || existing.sizeBytes === expectedHomeSize;
+      const knownSha256 = expectedHomeSha256
+        ? existing.sha256 || await this.hashHomeObject(item.objectKey)
+        : existing.sha256;
+      const hashMatches = !expectedHomeSha256 || knownSha256 === expectedHomeSha256;
+      if (hasVerificationEvidence && sizeMatches && hashMatches) {
+        return { ...existing, sha256: knownSha256 };
+      }
+    }
+    if (!sourceUrlMatchesObjectKey(item.sourceUrl, item.objectKey)) {
+      throw new Error("Source URL path does not match objectKey.");
+    }
+
+    const copied = await this.pullSemaphore.use(() => this.httpSemaphore.use(async () => {
+      const response = await this.fetch(item.sourceUrl, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(DEFAULT_REQUEST_TIMEOUT_MS),
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`Source download failed with HTTP ${response.status}.`);
+      }
+      const contentLength = Number(response.headers.get("content-length"));
+      if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+        throw new Error("Source response is missing a valid Content-Length.");
+      }
+      if (item.expectedSizeBytes != null && contentLength !== item.expectedSizeBytes) {
+        throw new Error(`Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`);
+      }
+
+      const hash = createHash("sha256");
+      let copiedBytes = 0;
+      const recordTransferredBytes = (bytes) => this.recordTransferredBytes(bytes);
+      const counter = new Transform({
+        transform(chunk, _encoding, callback) {
+          copiedBytes += chunk.length;
+          hash.update(chunk);
+          recordTransferredBytes(chunk.length);
+          callback(null, chunk);
+        },
+      });
+      const body = nodeReadable(response.body).pipe(counter);
+      const upload = await this.minioClient.send(new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: item.objectKey,
+        Body: body,
+        ContentLength: contentLength,
+        ContentType: item.mimeType || response.headers.get("content-type") || "application/octet-stream",
+      }));
+      if (copiedBytes !== contentLength) {
+        throw new Error(`Home MinIO copy ended at ${copiedBytes} of ${contentLength} bytes.`);
+      }
+      const sha256 = hash.digest("hex");
+      if (item.expectedSha256 && sha256 !== item.expectedSha256) {
+        throw new Error("Source SHA-256 does not match the expected checksum.");
+      }
+      return { contentLength, uploadEtag: normalizeEtag(upload.ETag), sha256 };
+    }, 2));
+    const verified = await this.headHomeObject(item.objectKey);
+    if (!verified || verified.sizeBytes !== copied.contentLength) {
+      throw new Error("Home MinIO HEAD verification failed after upload.");
+    }
+    return { ...verified, etag: verified.etag || copied.uploadEtag, sha256: copied.sha256 };
+  }
+
+  async hashHomeObject(objectKey) {
+    return this.httpSemaphore.use(async () => {
+      const response = await this.minioClient.send(new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+      const hash = createHash("sha256");
+      for await (const chunk of nodeReadable(response.Body)) hash.update(chunk);
+      return hash.digest("hex");
+    });
+  }
+
+  meteredReadable(body) {
+    const recordTransferredBytes = (bytes) => this.recordTransferredBytes(bytes);
+    return nodeReadable(body).pipe(new Transform({
+      transform(chunk, _encoding, callback) {
+        recordTransferredBytes(chunk.length);
+        callback(null, chunk);
+      },
+    }));
+  }
+
+  async stageHomeObject(item, expectedSize, expectedSha256) {
+    const digest = createHash("sha256").update(`${item.id}\n${item.objectKey}`).digest("hex");
+    const filePath = resolve(this.workDir, digest.slice(0, 2), digest);
+    await mkdir(dirname(filePath), { recursive: true });
+    const existing = await stat(filePath).catch(() => null);
+    if (existing?.isFile() && existing.size === expectedSize) {
+      const sha256 = await hashFile(filePath);
+      if (!expectedSha256 || sha256 === expectedSha256) return { filePath, sha256 };
+      await rm(filePath, { force: true });
+    }
+
+    return this.httpSemaphore.use(async () => {
+      const response = await this.minioClient.send(new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }));
+      const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      const hash = createHash("sha256");
+      let copiedBytes = 0;
+      const counter = new Transform({
+        transform(chunk, _encoding, callback) {
+          copiedBytes += chunk.length;
+          hash.update(chunk);
+          callback(null, chunk);
+        },
+      });
+      try {
+        await pipeline(nodeReadable(response.Body), counter, createWriteStream(tempPath, { flags: "wx" }));
+        if (copiedBytes !== expectedSize) throw new Error(`Staged object size mismatch: ${copiedBytes} of ${expectedSize}.`);
+        const sha256 = hash.digest("hex");
+        if (expectedSha256 && sha256 !== expectedSha256) throw new Error("Staged object SHA-256 mismatch.");
+        await rm(filePath, { force: true });
+        const { rename } = await import("node:fs/promises");
+        await rename(tempPath, filePath);
+        return { filePath, sha256 };
+      } catch (error) {
+        await rm(tempPath, { force: true }).catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
+  async headOssObject(client, objectKey) {
+    return this.httpSemaphore.use(async () => {
+      try {
+        const result = await client.head(objectKey);
+        return {
+          sizeBytes: Number(result.res?.headers?.["content-length"] ?? result.meta?.["content-length"] ?? 0),
+          etag: normalizeEtag(result.res?.headers?.etag),
+          sha256: result.meta?.sha256 || result.res?.headers?.["x-oss-meta-sha256"] || null,
+        };
+      } catch (error) {
+        if (error?.status === 404 || error?.code === "NoSuchKey") return null;
+        throw error;
+      }
+    });
+  }
+
+  async validatePublicUrl(url, expectedSize) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const head = await this.httpSemaphore.use(() => this.fetch(url, {
+        method: "HEAD",
+        redirect: "follow",
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => null));
+      if (head?.ok) {
+        const rawSize = head.headers.get("content-length");
+        const size = rawSize === null ? Number.NaN : Number(rawSize);
+        if (Number.isSafeInteger(size) && size === expectedSize) return true;
+      }
+      const range = await this.httpSemaphore.use(() => this.fetch(url, {
+        method: "GET",
+        headers: { Range: "bytes=0-0" },
+        redirect: "follow",
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => null));
+      if (range) {
+        const contentRange = range.headers.get("content-range") || "";
+        const rangeTotal = /^bytes\s+0-0\/(\d+)$/i.exec(contentRange)?.[1];
+        const rawRangeSize = range.headers.get("content-length");
+        const rangeSize = rawRangeSize === null ? Number.NaN : Number(rawRangeSize);
+        const validPartial = range.status === 206 && rangeTotal !== undefined && Number(rangeTotal) === expectedSize;
+        const validFull = range.status === 200 && Number.isSafeInteger(rangeSize) && rangeSize === expectedSize;
+        await range.body?.cancel?.().catch?.(() => undefined);
+        if (validPartial || validFull) return true;
+      }
+      if (attempt < 2) await delay(1000 * (attempt + 1));
+    }
+    return false;
+  }
+
+  async uploadHomeObjectToOss(item, home) {
+    const job = this.store.getJob(item.jobId);
+    const config = this.store.getDecryptedConfig(job.configVersionId);
+    const client = this.ossClientFactory(config);
+    const existing = await this.headOssObject(client, item.objectKey);
+    let etag = existing?.etag || null;
+    let sha256 = home.sha256 || item.expectedSha256 || null;
+
+    if (!existing || existing.sizeBytes !== home.sizeBytes || (sha256 && existing.sha256 !== sha256)) {
+      await this.ossSemaphore.use(async () => {
+        if (home.sizeBytes >= this.multipartThresholdBytes) {
+          const staged = await this.stageHomeObject(item, home.sizeBytes, sha256);
+          sha256 = staged.sha256;
+          const checkpoint = this.store.getCheckpoint(item.id);
+          let lastMultipartBytes = 0;
+          const result = await this.httpSemaphore.use(() => client.multipartUpload(item.objectKey, staged.filePath, {
+            parallel: this.multipartConcurrency,
+            partSize: this.partSizeBytes,
+            checkpoint: checkpoint && checkpoint.name === item.objectKey ? { ...checkpoint, file: staged.filePath } : undefined,
+            mime: item.mimeType || "application/octet-stream",
+            meta: sha256 ? { sha256 } : undefined,
+            progress: async (percentage, nextCheckpoint) => {
+              const uploadedBytes = Math.max(0, Math.min(home.sizeBytes, Math.round(Number(percentage || 0) * home.sizeBytes)));
+              this.recordTransferredBytes(Math.max(0, uploadedBytes - lastMultipartBytes));
+              lastMultipartBytes = Math.max(lastMultipartBytes, uploadedBytes);
+              if (!nextCheckpoint) return;
+              const serializable = { ...nextCheckpoint, file: staged.filePath };
+              this.store.updateItem(item.id, { checkpoint: serializable, stage: "OSS_UPLOADING" });
+              this.store.replaceMultipartParts(item.id, nextCheckpoint.doneParts, nextCheckpoint.partSize);
+            },
+          }), this.multipartConcurrency);
+          etag = normalizeEtag(result.etag || result.res?.headers?.etag);
+          await rm(staged.filePath, { force: true }).catch(() => undefined);
+        } else {
+          const result = await this.httpSemaphore.use(async () => {
+            const response = await this.minioClient.send(new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }));
+            return client.putStream(item.objectKey, this.meteredReadable(response.Body), {
+              contentLength: home.sizeBytes,
+              mime: item.mimeType || response.ContentType || "application/octet-stream",
+              meta: sha256 ? { sha256 } : undefined,
+            });
+          }, 2);
+          etag = normalizeEtag(result.res?.headers?.etag);
+        }
+      });
+    }
+
+    const verified = await this.headOssObject(client, item.objectKey);
+    if (!verified || verified.sizeBytes !== home.sizeBytes || (sha256 && verified.sha256 !== sha256)) {
+      throw new Error("OSS HEAD verification failed after upload.");
+    }
+    const directUrl = buildDirectOssUrl(config, item.objectKey);
+    const directVerified = await this.validatePublicUrl(directUrl, home.sizeBytes);
+    if (!directVerified) throw new Error("Direct OSS public URL verification failed.");
+
+    let selectedUrl = directUrl;
+    let cdnVerified = false;
+    let warning = null;
+    if (config.publicBaseUrl) {
+      const cdnUrl = `${config.publicBaseUrl.replace(/\/+$/, "")}/${encodeObjectKey(item.objectKey)}`;
+      cdnVerified = await this.validatePublicUrl(cdnUrl, home.sizeBytes);
+      if (cdnVerified) selectedUrl = cdnUrl;
+      else warning = "Configured CDN URL was unavailable; direct OSS URL was selected.";
+    }
+
+    return {
+      bucket: config.bucket,
+      sizeBytes: verified.sizeBytes,
+      etag: verified.etag || etag,
+      directUrl,
+      selectedUrl,
+      cdnVerified,
+      warning,
+    };
+  }
+
+  retryAt(attemptCount) {
+    const delayMs = Math.min(MAX_RETRY_DELAY_MS, 60_000 * 2 ** Math.max(0, attemptCount - 1));
+    return new Date(Date.now() + delayMs).toISOString();
+  }
+
+  async processItem(itemId) {
+    const item = this.store.claimItem(itemId);
+    if (!item) return;
+    try {
+      this.store.updateItem(item.id, { stage: "HOME_COPYING" });
+      const home = await this.copySourceToHome(item);
+      const verifiedAt = new Date().toISOString();
+      this.store.updateItem(item.id, {
+        stage: "HOME_VERIFIED",
+        homeSizeBytes: home.sizeBytes,
+        homeEtag: home.etag,
+        homeSha256: home.sha256,
+        homeVerifiedAt: verifiedAt,
+      });
+
+      if (item.targetTier === "COLD_HOME_MINIO") {
+        this.store.updateItem(item.id, {
+          status: "SUCCEEDED",
+          stage: "COMPLETED",
+          checkpoint: null,
+          finishedAt: new Date().toISOString(),
+        });
+        return;
+      }
+
+      this.store.updateItem(item.id, { stage: "OSS_UPLOADING" });
+      const oss = await this.uploadHomeObjectToOss(item, home);
+      this.store.updateItem(item.id, {
+        status: "SUCCEEDED",
+        stage: "COMPLETED",
+        ossBucket: oss.bucket,
+        ossSizeBytes: oss.sizeBytes,
+        ossEtag: oss.etag,
+        ossDirectUrl: oss.directUrl,
+        ossSelectedUrl: oss.selectedUrl,
+        ossCdnVerified: oss.cdnVerified,
+        ossVerifiedAt: new Date().toISOString(),
+        checkpoint: null,
+        warning: oss.warning,
+        finishedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      let ossConfig = null;
+      try {
+        const job = this.store.getJob(item.jobId);
+        if (job?.configVersionId) ossConfig = this.store.getDecryptedConfig(job.configVersionId);
+      } catch {
+        ossConfig = null;
+      }
+      const message = redactLifecycleMessage(
+        error instanceof Error ? error.message : String(error),
+        [
+          this.env.MINIO_WAULE_ACCESS_KEY,
+          this.env.MINIO_WAULE_SECRET_KEY,
+          this.env.MINIO_ROOT_USER,
+          this.env.MINIO_ROOT_PASSWORD,
+          this.env.HOME_MINIO_WEB_TOKEN,
+          ossConfig?.accessKeyId,
+          ossConfig?.accessKeySecret,
+        ],
+      );
+      const failed = item.attemptCount >= MAX_ATTEMPTS;
+      this.store.updateItem(item.id, {
+        status: failed ? "FAILED" : "RETRY_WAIT",
+        stage: failed ? "FAILED" : "RETRY_WAIT",
+        nextRetryAt: failed ? null : this.retryAt(item.attemptCount),
+        error: message.slice(0, 4000),
+        finishedAt: failed ? new Date().toISOString() : null,
+      });
+      if (failed) console.error(`[home-minio] lifecycle item ${item.id} exhausted retries: ${message}`);
+    }
+  }
+}

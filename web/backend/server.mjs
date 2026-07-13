@@ -7,6 +7,8 @@ import { dirname, resolve } from "node:path";
 import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
+import { LifecycleStore } from "./lifecycle-store.mjs";
+import { LifecycleTransferService } from "./lifecycle-service.mjs";
 
 const rootDir = resolve(new URL("../..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
@@ -20,10 +22,35 @@ const pushJobs = new Map();
 const pushQueue = [];
 let activePushJobs = 0;
 let latestPushJobId = "";
+let lifecycleStartupError = null;
+let lifecycleStore;
+try {
+  lifecycleStore = new LifecycleStore();
+} catch (error) {
+  lifecycleStartupError = error instanceof Error ? error.message : String(error);
+  console.error(`[home-minio] lifecycle encryption initialization failed: ${lifecycleStartupError}`);
+  lifecycleStore = new LifecycleStore({ encryptionKey: null });
+}
+let lifecycleService = null;
+try {
+  const lifecycleHealth = lifecycleStore.health();
+  if (!lifecycleHealth.ready) {
+    lifecycleStartupError = lifecycleStartupError || lifecycleHealth.encryptionError;
+  } else if (!token) {
+    lifecycleStartupError = "HOME_MINIO_WEB_TOKEN is required for lifecycle endpoints.";
+  } else {
+    lifecycleService = new LifecycleTransferService({ store: lifecycleStore, env: process.env });
+    lifecycleService.start();
+  }
+} catch (error) {
+  lifecycleStartupError = error instanceof Error ? error.message : String(error);
+  console.error(`[home-minio] lifecycle transfer service unavailable: ${lifecycleStartupError}`);
+}
 
 const editableKeys = [
   "MINIO_ROOT_USER",
   "MINIO_ROOT_PASSWORD",
+  "HOME_MINIO_BIND_ADDRESS",
   "MINIO_API_PORT",
   "MINIO_CONSOLE_PORT",
   "MINIO_DATA_DIR",
@@ -34,6 +61,10 @@ const editableKeys = [
   "HOME_MINIO_WEB_API_PORT",
   "HOME_MINIO_WEB_PORT",
   "HOME_MINIO_WEB_TOKEN",
+  "HOME_MINIO_STATE_DB",
+  "HOME_MINIO_CONFIG_ENCRYPTION_KEY",
+  "HOME_MINIO_CONFIG_ENCRYPTION_KEY_FILE",
+  "HOME_MINIO_TRANSFER_WORK_DIR",
   "HOME_MINIO_PUBLIC_ENDPOINT",
   "HOME_MINIO_CONSOLE_PUBLIC_URL",
   "NEWWAULE_API_BASE_URL",
@@ -43,6 +74,11 @@ const editableKeys = [
   "MEDIA_PULL_MANIFEST_PATH",
   "MEDIA_PULL_WORK_DIR",
   "MEDIA_PULL_CONCURRENCY",
+  "OSS_FILE_CONCURRENCY",
+  "OSS_MULTIPART_CONCURRENCY",
+  "OSS_MAX_HTTP_CONCURRENCY",
+  "OSS_MULTIPART_THRESHOLD_BYTES",
+  "OSS_PART_SIZE_BYTES",
   "BAIDUPAN_BACKUP_ENABLED",
   "BAIDUPAN_TOOL",
   "BAIDUPAN_REMOTE_DIR",
@@ -54,6 +90,19 @@ const editableKeys = [
   "BAIDUPCS_MAX_PARALLEL",
   "BAIDUPCS_UPLOAD_NORAPID",
 ];
+const secretEditableKeys = new Set([
+  "MINIO_ROOT_PASSWORD",
+  "MINIO_WAULE_SECRET_KEY",
+  "HOME_MINIO_WEB_TOKEN",
+  "HOME_MINIO_CONFIG_ENCRYPTION_KEY",
+  "NEWWAULE_HOME_MINIO_TOKEN",
+]);
+
+function sanitizeEditableValues(values) {
+  return Object.fromEntries(
+    Object.entries(values).map(([key, value]) => [key, secretEditableKeys.has(key) ? "" : value]),
+  );
+}
 
 function parseEnv(source) {
   const values = {};
@@ -163,6 +212,15 @@ function send(reply, statusCode, payload) {
     "access-control-allow-headers": "content-type,x-home-minio-token",
   });
   reply.end(JSON.stringify(payload));
+}
+
+function assertLifecycleReady() {
+  const health = lifecycleStore.health();
+  if (!token || !health.ready || !lifecycleService) {
+    const error = new Error(lifecycleStartupError || health.encryptionError || "Lifecycle transfer service is unavailable.");
+    error.statusCode = 503;
+    throw error;
+  }
 }
 
 function assertAuth(request) {
@@ -370,6 +428,9 @@ function drainPushQueue() {
     const job = pushJobs.get(jobId);
     if (!job || job.status !== "QUEUED") continue;
 
+    const claimed = lifecycleStore.claimCachePushJob(job.id);
+    if (!claimed) continue;
+
     activePushJobs += 1;
     job.status = "RUNNING";
     job.startedAt = new Date().toISOString();
@@ -397,6 +458,11 @@ function drainPushQueue() {
       job.status = "FAILED";
       job.error = error instanceof Error ? error.message : String(error);
       job.finishedAt = new Date().toISOString();
+      lifecycleStore.updateCachePushJob(job.id, {
+        status: "FAILED",
+        error: job.error,
+        finishedAt: job.finishedAt,
+      });
       console.error(`[home-minio] push job ${job.id} error: ${job.error}`);
       drainPushQueue();
     });
@@ -405,6 +471,11 @@ function drainPushQueue() {
       job.code = code ?? 1;
       job.status = job.code === 0 ? "SUCCEEDED" : "FAILED";
       job.finishedAt = new Date().toISOString();
+      lifecycleStore.updateCachePushJob(job.id, {
+        status: job.status,
+        error: job.status === "FAILED" ? (job.stderr || `exit ${job.code}`).slice(-4000) : null,
+        finishedAt: job.finishedAt,
+      });
       console.log(`[home-minio] push job ${job.id} exit ${job.code}`);
       drainPushQueue();
     });
@@ -419,12 +490,18 @@ function startPushJob(params) {
     throw error;
   }
   const existing = getActivePushJobForKey(objectKey);
-  if (existing) {
-    return { job: existing, alreadyRunning: true };
-  }
+  if (existing) return { job: existing, alreadyRunning: true };
+
+  const persisted = lifecycleStore.createCachePushJob({
+    objectKey,
+    newWauleApiUrl: params.newWauleApiUrl,
+    cacheUploadBaseUrl: params.cacheUploadBaseUrl,
+  });
+  const existingRuntime = pushJobs.get(persisted.job.id);
+  if (existingRuntime) return { job: existingRuntime, alreadyRunning: true };
 
   const job = {
-    id: randomUUID(),
+    id: persisted.job.id,
     status: "QUEUED",
     code: null,
     objectKey,
@@ -441,16 +518,52 @@ function startPushJob(params) {
   pushQueue.push(job.id);
   latestPushJobId = job.id;
   drainPushQueue();
-  return { job, alreadyRunning: false };
+  return { job, alreadyRunning: persisted.alreadyRunning };
+}
+
+async function resumeCachePushJobs() {
+  const { values } = await readEnv();
+  for (const persisted of lifecycleStore.listRunnableCachePushJobs(1000)) {
+    if (pushJobs.has(persisted.id)) continue;
+    const newWauleApiUrl = persisted.newWauleApiUrl || values.NEWWAULE_API_BASE_URL || "";
+    const cacheUploadBaseUrl = persisted.cacheUploadBaseUrl || values.NEWWAULE_CACHE_UPLOAD_BASE_URL || "";
+    const newWauleToken = values.NEWWAULE_HOME_MINIO_TOKEN || values.HOME_MINIO_WEB_TOKEN || token;
+    pushJobs.set(persisted.id, {
+      id: persisted.id,
+      status: "QUEUED",
+      code: null,
+      objectKey: persisted.objectKey,
+      newWauleApiUrl,
+      cacheUploadBaseUrl,
+      startedAt: null,
+      finishedAt: null,
+      stdout: "",
+      stderr: "",
+      error: null,
+      env: {
+        ...values,
+        NEWWAULE_API_BASE_URL: newWauleApiUrl,
+        ...(cacheUploadBaseUrl ? { NEWWAULE_CACHE_UPLOAD_BASE_URL: cacheUploadBaseUrl } : {}),
+        NEWWAULE_HOME_MINIO_TOKEN: newWauleToken,
+      },
+    });
+    pushQueue.push(persisted.id);
+    latestPushJobId = persisted.id;
+  }
+  drainPushQueue();
 }
 
 async function minioReady(values) {
   const apiPort = values.MINIO_API_PORT || "19000";
+  const internalEndpoint = String(
+    values.MINIO_INTERNAL_ENDPOINT || process.env.MINIO_INTERNAL_ENDPOINT || "http://minio:9000",
+  ).replace(/\/+$/, "");
+  const displayEndpoint = values.HOME_MINIO_PUBLIC_ENDPOINT || `http://127.0.0.1:${apiPort}`;
   try {
-    const response = await fetch(`http://minio:9000/minio/health/ready`, { signal: AbortSignal.timeout(2500) });
-    return { ok: response.ok, status: response.status, endpoint: `http://127.0.0.1:${apiPort}` };
+    const response = await fetch(`${internalEndpoint}/minio/health/ready`, { signal: AbortSignal.timeout(2500) });
+    return { ok: response.ok, status: response.status, endpoint: displayEndpoint };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error), endpoint: `http://127.0.0.1:${apiPort}` };
+    return { ok: false, error: error instanceof Error ? error.message : String(error), endpoint: displayEndpoint };
   }
 }
 
@@ -465,23 +578,36 @@ async function handle(request, reply) {
 
   if (request.method === "GET" && url.pathname === "/api/config") {
     const { values } = await readEnv();
-    return send(reply, 200, { values, editableKeys });
+    return send(reply, 200, {
+      values: sanitizeEditableValues(values),
+      configuredKeys: [...secretEditableKeys].filter((key) => Boolean(values[key])),
+      editableKeys,
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/config") {
     const body = await readJsonBody(request);
+    const current = await readEnv();
     const sanitized = {};
     for (const key of editableKeys) {
       if (Object.prototype.hasOwnProperty.call(body.values || {}, key)) {
-        sanitized[key] = String(body.values[key] ?? "");
+        const nextValue = String(body.values[key] ?? "");
+        sanitized[key] = secretEditableKeys.has(key) && !nextValue.trim()
+          ? current.values[key] || ""
+          : nextValue;
       }
     }
     const values = await saveEnv(sanitized);
-    return send(reply, 200, { values, message: "saved" });
+    return send(reply, 200, {
+      values: sanitizeEditableValues(values),
+      configuredKeys: [...secretEditableKeys].filter((key) => Boolean(values[key])),
+      message: "saved",
+    });
   }
 
   if (request.method === "GET" && url.pathname === "/api/status") {
     const { values } = await readEnv();
+    const lifecycleHealth = lifecycleStore.health();
     return send(reply, 200, {
       minio: await minioReady(values),
       ports: {
@@ -500,7 +626,8 @@ async function handle(request, reply) {
         region: "us-east-1",
         bucket: values.MINIO_BUCKET || "waule-media",
         accessKeyId: values.MINIO_WAULE_ACCESS_KEY || "",
-        secretAccessKey: values.MINIO_WAULE_SECRET_KEY || "",
+        secretAccessKey: "",
+        secretAccessKeyConfigured: Boolean(values.MINIO_WAULE_SECRET_KEY),
         forcePathStyle: "true",
         cacheDir: "storage/home-minio-cache",
         publicBaseUrl: values.NEWWAULE_API_BASE_URL || "https://api.example.com",
@@ -517,7 +644,37 @@ async function handle(request, reply) {
         cronSchedule: values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *",
       },
       pullJob: latestPullJobId && pullJobs.has(latestPullJobId) ? serializePullJob(pullJobs.get(latestPullJobId)) : null,
+      lifecycle: {
+        ...lifecycleHealth,
+        ready: lifecycleHealth.ready && Boolean(token) && Boolean(lifecycleService),
+        ...(lifecycleService ? { settings: lifecycleService.settings() } : {}),
+        ...(lifecycleService ? { telemetry: lifecycleService.telemetry() } : {}),
+        recentJobs: lifecycleStore.listRecentJobs(10),
+        startupError: lifecycleStartupError,
+      },
     });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/lifecycle/config-versions") {
+    assertLifecycleReady();
+    const body = await readJsonBody(request);
+    const configVersion = lifecycleStore.upsertConfigVersion(body.oss || body);
+    return send(reply, 200, { configVersion });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/lifecycle/jobs") {
+    assertLifecycleReady();
+    const body = await readJsonBody(request);
+    const job = await lifecycleService.submitJob(body);
+    return send(reply, job.status === "QUEUED" ? 202 : 200, { job, jobId: job.id });
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/api/lifecycle/jobs/")) {
+    assertLifecycleReady();
+    const jobId = decodeURIComponent(url.pathname.slice("/api/lifecycle/jobs/".length));
+    const job = lifecycleService.getJob(jobId);
+    if (!job) return send(reply, 404, { message: "lifecycle job not found" });
+    return send(reply, 200, { job, jobId: job.id });
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/backup-dry-run") {
@@ -642,10 +799,20 @@ async function handle(request, reply) {
       : jobId
         ? pushJobs.get(jobId)
         : null;
-    if (!job) {
+    const persistedJob = !job
+      ? objectKey
+        ? lifecycleStore.findCachePushJobByObjectKey(objectKey)
+        : jobId
+          ? lifecycleStore.getCachePushJob(jobId)
+          : null
+      : null;
+    if (!job && !persistedJob) {
       return send(reply, 404, { message: "push job not found" });
     }
-    return send(reply, 200, { job: serializePushJob(job), jobId: job.id });
+    return send(reply, 200, {
+      job: job ? serializePushJob(job) : persistedJob,
+      jobId: job?.id || persistedJob.id,
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/actions/install-cron") {
@@ -677,3 +844,19 @@ createServer((request, reply) => {
 }).listen(port, "0.0.0.0", () => {
   console.log(`home-minio web api listening on ${port}`);
 });
+
+void resumeCachePushJobs().catch((error) => {
+  console.error(`[home-minio] cache push recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+});
+
+async function shutdown(signal) {
+  console.log(`[home-minio] received ${signal}, waiting for lifecycle transfers to stop`);
+  await lifecycleService?.stop().catch((error) => {
+    console.error(`[home-minio] lifecycle shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  lifecycleStore.close();
+  process.exit(0);
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
