@@ -11,8 +11,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "${HOME_MINIO_BIND_ADDRESS:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
-      - "${HOME_MINIO_BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${MINIO_API_PORT:-9000}:9000"
+      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - ${MINIO_DATA_DIR:-./data}:/data
     healthcheck:
@@ -53,7 +53,7 @@ services:
       HOME_MINIO_TRANSFER_WORK_DIR: ${HOME_MINIO_TRANSFER_WORK_DIR:-/data/transfer-work}
     command: ["node", "/app/web/backend/server.mjs"]
     ports:
-      - "${HOME_MINIO_BIND_ADDRESS:-127.0.0.1}:${HOME_MINIO_WEB_API_PORT:-19090}:${HOME_MINIO_WEB_API_PORT:-19090}"
+      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${HOME_MINIO_WEB_API_PORT:-19090}:${HOME_MINIO_WEB_API_PORT:-19090}"
     volumes:
       - .:/app
       - /app/node_modules
@@ -74,7 +74,7 @@ services:
     depends_on:
       - web-api
     ports:
-      - "${HOME_MINIO_BIND_ADDRESS:-127.0.0.1}:${HOME_MINIO_WEB_PORT:-19091}:80"
+      - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${HOME_MINIO_WEB_PORT:-19091}:80"
     volumes:
       - ./web/frontend:/usr/share/nginx/html:ro
 

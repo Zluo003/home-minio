@@ -29,11 +29,13 @@ Web API:        19090
 Web Console:    19091
 ```
 
-Bind the published ports only to localhost or the home server's Tailscale address. Do not use a public-interface wildcard:
+Published ports listen on all local interfaces by default so the console and API are reachable from both the LAN and Tailscale:
 
 ```env
-HOME_MINIO_BIND_ADDRESS=100.x.y.z
+HOME_MINIO_BIND_ADDRESS=0.0.0.0
 ```
+
+Do not configure router port forwarding for these ports. Restrict access with the host firewall to the LAN subnet and `tailscale0`. To expose the services on only one interface, replace `0.0.0.0` with that interface's LAN or Tailscale address; use `127.0.0.1` for local-only access.
 
 Open the local management console:
 
