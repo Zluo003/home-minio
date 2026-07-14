@@ -24,3 +24,11 @@ test("configuration no longer exposes a lifecycle encryption key", () => {
   assert.equal(SECRET_CONFIG_KEYS.has("MINIO_ROOT_PASSWORD"), true);
   assert.equal(SECRET_CONFIG_KEYS.has("HOME_MINIO_WEB_TOKEN"), true);
 });
+
+test("configuration exposes one unified Home MinIO management token", () => {
+  const visibleTokenFields = CONFIG_PAGES
+    .flatMap((page) => page.fields)
+    .filter((field) => field.type === "password" && !field.hidden && /TOKEN/.test(field.key));
+  assert.deepEqual(visibleTokenFields.map((field) => field.key), ["HOME_MINIO_WEB_TOKEN"]);
+  assert.equal(CONFIG_FIELDS.get("NEWWAULE_HOME_MINIO_TOKEN")?.hidden, true);
+});

@@ -7,6 +7,11 @@ import { dirname, resolve } from "node:path";
 import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
+import {
+  collectHomeMinioAuthTokens,
+  preferredHomeMinioToken,
+  synchronizeHomeMinioTokenValues,
+} from "./home-minio-token.mjs";
 import { LifecycleStore } from "./lifecycle-store.mjs";
 import { LifecycleTransferService } from "./lifecycle-service.mjs";
 import { CONFIG_FIELDS, SECRET_CONFIG_KEYS } from "../frontend/config-schema.js";
@@ -14,7 +19,10 @@ import { CONFIG_FIELDS, SECRET_CONFIG_KEYS } from "../frontend/config-schema.js"
 const rootDir = resolve(new URL("../..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
 const port = Number(process.env.HOME_MINIO_WEB_API_PORT || 19090);
-const token = process.env.HOME_MINIO_WEB_TOKEN || "";
+let acceptedAuthTokens = new Set(collectHomeMinioAuthTokens({
+  ...process.env,
+  ...(await readEnv()).values,
+}));
 const outputTailLimit = 12000;
 const pullProgressPrefix = "HOME_MINIO_PROGRESS ";
 const pullJobs = new Map();
@@ -183,8 +191,8 @@ function assertLifecycleReady() {
 }
 
 function assertAuth(request) {
-  if (!token) return;
-  if (request.headers["x-home-minio-token"] !== token) {
+  if (!acceptedAuthTokens.size) return;
+  if (!acceptedAuthTokens.has(String(request.headers["x-home-minio-token"] || "").trim())) {
     const error = new Error("Unauthorized");
     error.statusCode = 401;
     throw error;
@@ -486,7 +494,7 @@ async function resumeCachePushJobs() {
     if (pushJobs.has(persisted.id)) continue;
     const newWauleApiUrl = persisted.newWauleApiUrl || values.NEWWAULE_API_BASE_URL || "";
     const cacheUploadBaseUrl = persisted.cacheUploadBaseUrl || values.NEWWAULE_CACHE_UPLOAD_BASE_URL || "";
-    const newWauleToken = values.NEWWAULE_HOME_MINIO_TOKEN || values.HOME_MINIO_WEB_TOKEN || token;
+    const newWauleToken = preferredHomeMinioToken(values);
     pushJobs.set(persisted.id, {
       id: persisted.id,
       status: "QUEUED",
@@ -556,7 +564,8 @@ async function handle(request, reply) {
           : nextValue;
       }
     }
-    const values = await saveEnv(sanitized);
+    const values = await saveEnv(synchronizeHomeMinioTokenValues(sanitized));
+    acceptedAuthTokens = new Set(collectHomeMinioAuthTokens({ ...process.env, ...values }));
     lifecycleService?.reconfigure({ ...process.env, ...values });
     return send(reply, 200, {
       values: sanitizeEditableValues(values),
@@ -737,7 +746,7 @@ async function handle(request, reply) {
     }
     const newWauleApiUrl = String(body.newWauleApiUrl || values.NEWWAULE_API_BASE_URL || "").replace(/\/+$/, "");
     const cacheUploadBaseUrl = String(body.cacheUploadBaseUrl || values.NEWWAULE_CACHE_UPLOAD_BASE_URL || "").replace(/\/+$/, "");
-    const newWauleToken = String(body.token || values.NEWWAULE_HOME_MINIO_TOKEN || values.HOME_MINIO_WEB_TOKEN || "");
+    const newWauleToken = String(body.token || preferredHomeMinioToken(values));
     if (!newWauleApiUrl) {
       return send(reply, 400, { message: "newWauleApiUrl is required" });
     }

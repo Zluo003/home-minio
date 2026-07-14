@@ -97,7 +97,7 @@ function renderConfigPages() {
   for (const page of CONFIG_PAGES) {
     const slot = document.querySelector(`[data-config-page="${page.id}"]`);
     if (!slot) continue;
-    const fields = page.fields.filter((field) => configState.editableKeys.has(field.key));
+    const fields = page.fields.filter((field) => !field.hidden && configState.editableKeys.has(field.key));
     slot.innerHTML = `
       <div class="page-heading">
         <div>

@@ -117,9 +117,10 @@ export const CONFIG_PAGES = [
       },
       {
         key: "NEWWAULE_HOME_MINIO_TOKEN",
-        label: "缓存回推令牌",
-        help: "必须与 NewWaule 后台保存的 Home MinIO 管理 API 令牌一致；留空不修改。",
+        label: "旧版缓存回推令牌",
+        help: "仅用于兼容旧配置；保存管理 API 令牌时会自动同步。",
         type: "password",
+        hidden: true,
       },
       {
         key: "CACHE_PUSH_CONCURRENCY",
@@ -334,9 +335,8 @@ export const CONFIG_PAGES = [
       {
         key: "HOME_MINIO_WEB_TOKEN",
         label: "管理 API 令牌",
-        help: "保护控制台和生命周期 API；必须与 NewWaule 后台保存的令牌一致，留空不修改。",
+        help: "同时用于控制台、生命周期 API 和缓存回推；必须与 NewWaule 后台保存的令牌一致，留空不修改。",
         type: "password",
-        restart: true,
         wide: true,
       },
     ],

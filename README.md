@@ -103,16 +103,16 @@ home-minio lifecycle worker -> Aliyun OSS
 browser/user -> NewWaule /local-media/<objectKey>
 ```
 
-Configure cache push on the `NewWaule 连接` page. These are page fields; users do not need to edit `.env`:
+Configure the NewWaule URL and cache push concurrency on the `NewWaule 连接` page. Configure one shared `管理 API 令牌` on the `控制台设置` page and save the same token in NewWaule. Users do not need to edit `.env`:
 
 ```text
 NEWWAULE_API_BASE_URL=https://api.example.com
 NEWWAULE_CACHE_UPLOAD_BASE_URL=
-NEWWAULE_HOME_MINIO_TOKEN=<与控制台设置页的管理 API 令牌相同>
+HOME_MINIO_WEB_TOKEN=<与 NewWaule 后台相同的管理 API 令牌>
 CACHE_PUSH_CONCURRENCY=4
 ```
 
-`NEWWAULE_HOME_MINIO_TOKEN` should match the `管理 API 令牌` saved in NewWaule. `NEWWAULE_CACHE_UPLOAD_BASE_URL` can stay empty when NewWaule triggers the push, because NewWaule sends the exact upload endpoint. The MinIO S3 endpoint can still stay on Tailscale/WireGuard for private control and archive verification, but large cache transfers are pushed from home-minio to NewWaule over the public NewWaule API path.
+`HOME_MINIO_WEB_TOKEN` protects Home MinIO control requests and NewWaule cache uploads. The old `NEWWAULE_HOME_MINIO_TOKEN` value remains accepted for compatibility but is hidden from the page; saving the unified token synchronizes both values. `NEWWAULE_CACHE_UPLOAD_BASE_URL` can stay empty when NewWaule triggers the push, because NewWaule sends the exact upload endpoint. The MinIO S3 endpoint can still stay on Tailscale/WireGuard for private control and archive verification, but large cache transfers are pushed from home-minio to NewWaule over the public NewWaule API path.
 
 ## Pull Media From NewWaule Manifest
 

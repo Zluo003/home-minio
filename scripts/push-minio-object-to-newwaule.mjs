@@ -1,6 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { preferredHomeMinioToken } from "../web/backend/home-minio-token.mjs";
 
 const rootDir = resolve(new URL("..", import.meta.url).pathname);
 const envPath = resolve(rootDir, ".env");
@@ -142,7 +143,7 @@ async function main() {
   const cacheUploadBaseUrl = String(
     env.NEWWAULE_CACHE_UPLOAD_BASE_URL || (newWauleApiUrl ? `${newWauleApiUrl}/api/v1/home-minio/cache/objects` : ""),
   ).replace(/\/+$/, "");
-  const token = String(env.NEWWAULE_HOME_MINIO_TOKEN || env.HOME_MINIO_WEB_TOKEN || "");
+  const token = preferredHomeMinioToken(env);
   if (!cacheUploadBaseUrl) {
     throw new Error("Missing NEWWAULE_CACHE_UPLOAD_BASE_URL or NEWWAULE_API_BASE_URL.");
   }
