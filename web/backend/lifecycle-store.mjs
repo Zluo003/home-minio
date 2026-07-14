@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "SUCCEEDED_WITH_ERRORS", "FAILED", "CANCELLED"]);
 const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
@@ -559,6 +559,18 @@ export class LifecycleStore {
         `).run(migratedAt);
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(4, migratedAt);
       })();
+      current = 4;
+    }
+    if (current < 5) {
+      this.db.transaction(() => {
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS callback_outbox_run_runnable_idx
+            ON callback_outbox(run_id, status, next_retry_at, sequence);
+          CREATE INDEX IF NOT EXISTS transfer_items_job_status_idx
+            ON transfer_items(job_id, status);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(5, nowIso());
+      })();
     }
   }
 
@@ -1072,30 +1084,46 @@ export class LifecycleStore {
 
   listRunnableCallbacks(limit = 100) {
     return this.db.prepare(`
+      WITH eligible_run AS (
+        SELECT j.id
+        FROM transfer_jobs j
+        WHERE j.manifest_status = 'SEALED'
+          AND j.status NOT IN ('CANCELLED', 'FAILED')
+          AND NOT EXISTS (
+            SELECT 1 FROM transfer_items active_items
+            WHERE active_items.job_id = j.id
+              AND active_items.status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')
+          )
+          AND (
+            SELECT COUNT(*) FROM callback_outbox all_callbacks
+            WHERE all_callbacks.run_id = j.id
+          ) = (
+            SELECT COUNT(*) FROM transfer_items all_items
+            WHERE all_items.job_id = j.id
+          )
+          AND EXISTS (
+            SELECT 1 FROM callback_outbox ready_callbacks
+            WHERE ready_callbacks.run_id = j.id
+              AND (
+                ready_callbacks.status = 'QUEUED'
+                OR (ready_callbacks.status = 'RETRY_WAIT'
+                  AND (ready_callbacks.next_retry_at IS NULL OR ready_callbacks.next_retry_at <= ?))
+              )
+          )
+        ORDER BY j.created_at, j.id
+        LIMIT 1
+      )
       SELECT c.*, j.callback_url, j.callback_token
       FROM callback_outbox c
       JOIN transfer_jobs j ON j.id = c.run_id
+      JOIN eligible_run selected ON selected.id = c.run_id
       WHERE (
           c.status = 'QUEUED'
           OR (c.status = 'RETRY_WAIT' AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?))
         )
-        AND j.manifest_status = 'SEALED'
-        AND j.status NOT IN ('CANCELLED', 'FAILED')
-        AND NOT EXISTS (
-          SELECT 1 FROM transfer_items active_items
-          WHERE active_items.job_id = c.run_id
-            AND active_items.status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')
-        )
-        AND (
-          SELECT COUNT(*) FROM callback_outbox all_callbacks
-          WHERE all_callbacks.run_id = c.run_id
-        ) = (
-          SELECT COUNT(*) FROM transfer_items all_items
-          WHERE all_items.job_id = c.run_id
-        )
-      ORDER BY c.run_id, c.sequence
+      ORDER BY c.sequence
       LIMIT ?
-    `).all(nowIso(), Math.max(1, Math.min(1000, limit))).map((row) => ({
+    `).all(nowIso(), nowIso(), Math.max(1, Math.min(1000, limit))).map((row) => ({
       ...serializeCallback(row),
       callbackUrl: row.callback_url,
       callbackToken: row.callback_token,

@@ -71,6 +71,11 @@ function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
+function scheduleIoTurn(callback) {
+  const immediate = setImmediate(callback);
+  immediate.unref?.();
+}
+
 function normalizeEtag(value) {
   return typeof value === "string" ? value.replace(/^"|"$/g, "") : null;
 }
@@ -374,7 +379,7 @@ export class LifecycleTransferService {
           this.activeItemIds.delete(candidate.id);
           this.activeObjectKeys.delete(candidate.objectKey);
           this.applyPendingEnvironment();
-          if (!this.stopped) queueMicrotask(() => void this.kick());
+          if (!this.stopped) scheduleIoTurn(() => void this.kick());
         });
     }
   }
@@ -407,7 +412,7 @@ export class LifecycleTransferService {
         .catch((error) => console.error(`[home-minio] lifecycle manifest ${runId} failed: ${error instanceof Error ? error.message : String(error)}`))
         .finally(() => {
           this.activeManifestRuns.delete(runId);
-          if (!this.stopped) queueMicrotask(() => void this.kick());
+          if (!this.stopped) scheduleIoTurn(() => void this.kick());
         });
     }
   }
@@ -458,7 +463,7 @@ export class LifecycleTransferService {
   }
 
   kickCallbacks() {
-    if (this.stopped) return;
+    if (this.stopped || this.activeCallbackRuns.size > 0) return;
     const runnable = this.store.listRunnableCallbacks(100);
     const first = runnable.find((item) => !this.activeCallbackRuns.has(item.runId));
     if (!first) return;
@@ -475,7 +480,7 @@ export class LifecycleTransferService {
       ))
       .finally(() => {
         this.activeCallbackRuns.delete(first.runId);
-        if (!this.stopped) queueMicrotask(() => this.kickCallbacks());
+        if (!this.stopped) scheduleIoTurn(() => this.kickCallbacks());
       });
   }
 

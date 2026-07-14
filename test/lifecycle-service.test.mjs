@@ -347,6 +347,23 @@ test("one missing source is reported without preventing other manifest items fro
   }
 });
 
+test("an active callback delivery prevents repeated outbox scans", async () => {
+  const context = await setupService({ body: Buffer.from("callback-scan-guard") });
+  try {
+    let scans = 0;
+    context.store.listRunnableCallbacks = () => {
+      scans += 1;
+      return [];
+    };
+    context.service.activeCallbackRuns.add("active-run");
+    context.service.kickCallbacks();
+    assert.equal(scans, 0);
+  } finally {
+    context.service.activeCallbackRuns.delete("active-run");
+    await cleanup(context);
+  }
+});
+
 test("cancelling a streaming run aborts an active manifest request", async () => {
   const context = await setupService({ body: Buffer.from("manifest-cancel") });
   try {

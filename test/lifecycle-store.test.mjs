@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,7 +56,10 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
     assert.equal(store.db.pragma("journal_mode", { simple: true }), "wal");
     assert.equal(store.db.pragma("foreign_keys", { simple: true }), 1);
     assert.ok(store.db.pragma("busy_timeout", { simple: true }) >= 5_000);
-    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 4);
+    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 5);
+    const indexes = new Set(store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((row) => row.name));
+    assert.equal(indexes.has("callback_outbox_run_runnable_idx"), true);
+    assert.equal(indexes.has("transfer_items_job_status_idx"), true);
   });
 });
 
@@ -119,7 +122,7 @@ test("existing v2 lifecycle state upgrades to streaming runs without losing jobs
 
   const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 4);
+    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 5);
     assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM transfer_items").get().count, 1);
     assert.equal(second.getJob("run-before-v2").items[0].home, null);
     assert.ok(second.db.pragma("table_info(transfer_items)").some((column) => column.name === "home_reused"));
@@ -160,6 +163,65 @@ test("streaming manifests accept a complete run larger than the legacy 100 item 
     assert.equal(sealed.totalCount, expectedCount);
     assert.equal(sealed.manifestAcceptedCount, expectedCount);
     assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM transfer_items WHERE job_id = ?").get(run.id).count, expectedCount);
+  });
+});
+
+test("large callback outboxes select one runnable batch without scanning every item per row", async () => {
+  await withStore(({ store }) => {
+    const expectedCount = 5_000;
+    const run = store.createStreamingJob({
+      id: "large-callback-outbox",
+      mediaKind: "GENERATED_MEDIA",
+      expectedCount,
+      manifestUrl: "https://api.example.test/internal/large-callback-outbox/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/large-callback-outbox/results",
+      callbackToken: "callback-token",
+    });
+    store.claimManifestRun(run.id);
+    for (let offset = 0; offset < expectedCount; offset += 500) {
+      store.appendManifestItems(run.id, Array.from({ length: 500 }, (_, index) => {
+        const sequence = offset + index + 1;
+        return {
+          lifecycleObjectId: `large-callback-object-${sequence}`,
+          objectKey: `gateway-media/large-callback/${sequence}.png`,
+          sourceUrl: `https://api.example.test/local-media/gateway-media/large-callback/${sequence}.png`,
+          targetTier: "COLD_HOME_MINIO",
+          expectedSizeBytes: sequence,
+          mimeType: "image/png",
+        };
+      }));
+    }
+    store.completeManifest(run.id);
+    const completedAt = new Date().toISOString();
+    store.db.prepare(`
+      UPDATE transfer_items
+      SET status = 'SUCCEEDED', stage = 'COMPLETED', finished_at = ?, updated_at = ?
+      WHERE job_id = ?
+    `).run(completedAt, completedAt, run.id);
+    const items = store.db.prepare("SELECT id FROM transfer_items WHERE job_id = ? ORDER BY created_at, id").all(run.id);
+    const insert = store.db.prepare(`
+      INSERT INTO callback_outbox(
+        id, run_id, item_id, sequence, status, payload_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'QUEUED', '{}', ?, ?)
+    `);
+    store.db.transaction(() => {
+      items.forEach((item, index) => insert.run(randomUUID(), run.id, item.id, index + 1, completedAt, completedAt));
+      store.db.prepare(`
+        UPDATE transfer_jobs
+        SET status = 'RESULTS_PENDING', processed_count = ?, succeeded_count = ?,
+            last_callback_sequence = ?, updated_at = ?
+        WHERE id = ?
+      `).run(expectedCount, expectedCount, expectedCount, completedAt, run.id);
+    })();
+
+    const startedAt = performance.now();
+    const callbacks = store.listRunnableCallbacks(100);
+    const elapsedMs = performance.now() - startedAt;
+
+    assert.equal(callbacks.length, 100);
+    assert.deepEqual(callbacks.map((callback) => callback.sequence), Array.from({ length: 100 }, (_, index) => index + 1));
+    assert.ok(elapsedMs < 1_000, `callback query took ${elapsedMs.toFixed(1)} ms`);
   });
 });
 
@@ -371,7 +433,7 @@ test("schema v4 restores exhausted callbacks for completed legacy runs", async (
     WHERE id = ?
   `).run(callback.id);
   first.db.prepare("UPDATE transfer_jobs SET status = 'FAILED', error = 'legacy callback failure' WHERE id = ?").run(run.id);
-  first.db.prepare("DELETE FROM schema_migrations WHERE version = 4").run();
+  first.db.prepare("DELETE FROM schema_migrations WHERE version >= 4").run();
   first.close();
 
   const second = new LifecycleStore({ dbPath, encryptionKey: null });
