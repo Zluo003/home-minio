@@ -631,6 +631,34 @@ async function handle(request, reply) {
     return send(reply, 200, { configVersion });
   }
 
+  if (request.method === "POST" && url.pathname === "/api/v2/lifecycle/runs") {
+    assertLifecycleReady();
+    const body = await readJsonBody(request);
+    const run = await lifecycleService.submitStreamingJob(body);
+    return send(reply, 202, { run, runId: run.id });
+  }
+
+  const lifecycleV2ActionMatch = /^\/api\/v2\/lifecycle\/runs\/([^/]+)\/(cancel|resume)$/.exec(url.pathname);
+  if (request.method === "POST" && lifecycleV2ActionMatch) {
+    assertLifecycleReady();
+    const runId = decodeURIComponent(lifecycleV2ActionMatch[1]);
+    const action = lifecycleV2ActionMatch[2];
+    const changed = action === "cancel"
+      ? lifecycleService.cancelStreamingJob(runId)
+      : lifecycleService.resumeStreamingJob(runId);
+    if (!changed) return send(reply, 404, { message: "lifecycle run not found" });
+    const run = lifecycleService.getJobSummary(runId);
+    return send(reply, 200, { run, runId });
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/api/v2/lifecycle/runs/")) {
+    assertLifecycleReady();
+    const runId = decodeURIComponent(url.pathname.slice("/api/v2/lifecycle/runs/".length));
+    const run = lifecycleService.getJobSummary(runId);
+    if (!run) return send(reply, 404, { message: "lifecycle run not found" });
+    return send(reply, 200, { run, runId });
+  }
+
   if (request.method === "POST" && url.pathname === "/api/lifecycle/jobs") {
     assertLifecycleReady();
     const body = await readJsonBody(request);

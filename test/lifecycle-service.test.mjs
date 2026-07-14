@@ -9,6 +9,7 @@ import {
   LifecycleTransferService,
   redactLifecycleMessage,
   sourceUrlMatchesObjectKey,
+  takeContiguousCallbackBatch,
 } from "../web/backend/lifecycle-service.mjs";
 import { LifecycleStore } from "../web/backend/lifecycle-store.mjs";
 
@@ -167,6 +168,19 @@ test("source URL validation requires an exact object key path", () => {
   assert.equal(sourceUrlMatchesObjectKey("https://cdn.test/media-prefix/gateway-media/a.png", "gateway-media/a.png"), true);
 });
 
+test("callback delivery batches stop at sequence gaps", () => {
+  const callbacks = [
+    { id: "callback-2", runId: "run-a", sequence: 2 },
+    { id: "callback-3", runId: "run-a", sequence: 3 },
+    { id: "callback-5", runId: "run-a", sequence: 5 },
+    { id: "callback-6", runId: "run-b", sequence: 6 },
+  ];
+  assert.deepEqual(
+    takeContiguousCallbackBatch(callbacks).map((callback) => callback.sequence),
+    [2, 3],
+  );
+});
+
 test("lifecycle error messages redact exact credentials and credential-shaped fields", () => {
   const message = redactLifecycleMessage(
     "request failed accessKeySecret=oss-super-secret Authorization:BearerToken token=home-token",
@@ -243,6 +257,91 @@ test("permanent source HTTP errors fail immediately instead of blocking a batch 
     assert.equal(failed.items[0].attemptCount, 1);
     assert.equal(failed.items[0].nextRetryAt, null);
     assert.match(failed.items[0].error, /HTTP 404/);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test("one missing source is reported without preventing other manifest items from completing", async () => {
+  const body = Buffer.from("mixed-manifest-source");
+  const context = await setupService({ body });
+  try {
+    const run = context.store.createStreamingJob({
+      id: "mixed-source-run",
+      mediaKind: "GENERATED_MEDIA",
+      expectedCount: 2,
+      manifestUrl: "https://source.example.test/manifests/mixed.ndjson",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/mixed-source-run/results",
+      callbackToken: "callback-token",
+    });
+    context.store.claimManifestRun(run.id);
+    context.store.appendManifestItems(run.id, [
+      {
+        lifecycleObjectId: "media-missing",
+        objectKey: "gateway-media/missing.png",
+        sourceUrl: "https://source.example.test/local-media/gateway-media/missing.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: body.length,
+        mimeType: "image/png",
+      },
+      {
+        lifecycleObjectId: "media-present",
+        objectKey: "gateway-media/present.png",
+        sourceUrl: "https://source.example.test/local-media/gateway-media/present.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: body.length,
+        mimeType: "image/png",
+      },
+    ]);
+    context.store.completeManifest(run.id);
+    context.service.fetch = async (url) => String(url).includes("/missing.png")
+      ? new Response(null, { status: 404 })
+      : new Response(body, { headers: { "content-length": String(body.length), "content-type": "image/png" } });
+
+    for (const item of context.store.getJob(run.id).items) await context.service.processItem(item.id);
+
+    const completed = context.store.getJob(run.id);
+    assert.equal(completed.status, "FAILED");
+    assert.equal(completed.processedCount, 2);
+    assert.equal(completed.succeededCount, 1);
+    assert.equal(completed.failedCount, 1);
+    assert.deepEqual(completed.items.map((item) => item.status).sort(), ["FAILED", "SUCCEEDED"]);
+    assert.equal(context.store.db.prepare("SELECT COUNT(*) AS count FROM callback_outbox WHERE run_id = ?").get(run.id).count, 2);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test("cancelling a streaming run aborts an active manifest request", async () => {
+  const context = await setupService({ body: Buffer.from("manifest-cancel") });
+  try {
+    context.service.fetch = async (_url, options = {}) => new Promise((_resolve, reject) => {
+      const abort = () => reject(options.signal?.reason instanceof Error ? options.signal.reason : new Error("aborted"));
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+    });
+    context.service.start();
+    await context.service.submitStreamingJob({
+      id: "cancel-manifest-run",
+      mediaKind: "GENERATED_MEDIA",
+      expectedCount: 1,
+      manifestUrl: "https://api.example.test/internal/cancel-manifest-run/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/cancel-manifest-run/results",
+      callbackToken: "callback-token",
+    });
+    const deadline = Date.now() + 1_000;
+    while (!context.service.activeManifestRuns.has("cancel-manifest-run") && Date.now() < deadline) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    }
+    assert.equal(context.service.activeManifestRuns.has("cancel-manifest-run"), true);
+    context.service.cancelStreamingJob("cancel-manifest-run");
+    while (context.service.activeManifestRuns.has("cancel-manifest-run") && Date.now() < deadline) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    }
+    assert.equal(context.service.activeManifestRuns.has("cancel-manifest-run"), false);
+    assert.equal(context.store.getJobSummary("cancel-manifest-run").status, "CANCELLED");
   } finally {
     await cleanup(context);
   }

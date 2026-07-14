@@ -56,7 +56,7 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
     assert.equal(store.db.pragma("journal_mode", { simple: true }), "wal");
     assert.equal(store.db.pragma("foreign_keys", { simple: true }), 1);
     assert.ok(store.db.pragma("busy_timeout", { simple: true }) >= 5_000);
-    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 2);
+    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 3);
   });
 });
 
@@ -82,7 +82,7 @@ test("Home verification records whether an existing object was reused", async ()
   });
 });
 
-test("existing v1 lifecycle state upgrades to reuse tracking without losing jobs", async () => {
+test("existing v2 lifecycle state upgrades to streaming runs without losing jobs", async () => {
   const root = await mkdtemp(join(tmpdir(), "home-minio-v1-upgrade-"));
   const dbPath = join(root, "state.sqlite");
   const first = new LifecycleStore({ dbPath, encryptionKey: null });
@@ -98,14 +98,28 @@ test("existing v1 lifecycle state upgrades to reuse tracking without losing jobs
     }],
   });
   first.db.exec(`
-    ALTER TABLE transfer_items DROP COLUMN home_reused;
-    DELETE FROM schema_migrations WHERE version = 2;
+    DROP TABLE callback_outbox;
+    DROP INDEX transfer_jobs_manifest_runnable_idx;
+    ALTER TABLE transfer_items DROP COLUMN failure_kind;
+    ALTER TABLE transfer_items DROP COLUMN failure_status_code;
+    ALTER TABLE transfer_items DROP COLUMN retryable;
+    ALTER TABLE transfer_jobs DROP COLUMN manifest_url;
+    ALTER TABLE transfer_jobs DROP COLUMN manifest_token;
+    ALTER TABLE transfer_jobs DROP COLUMN callback_url;
+    ALTER TABLE transfer_jobs DROP COLUMN callback_token;
+    ALTER TABLE transfer_jobs DROP COLUMN manifest_status;
+    ALTER TABLE transfer_jobs DROP COLUMN expected_count;
+    ALTER TABLE transfer_jobs DROP COLUMN manifest_accepted_count;
+    ALTER TABLE transfer_jobs DROP COLUMN manifest_attempt_count;
+    ALTER TABLE transfer_jobs DROP COLUMN manifest_next_retry_at;
+    ALTER TABLE transfer_jobs DROP COLUMN last_callback_sequence;
+    DELETE FROM schema_migrations WHERE version = 3;
   `);
   first.close();
 
   const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 2);
+    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 3);
     assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM transfer_items").get().count, 1);
     assert.equal(second.getJob("run-before-v2").items[0].home, null);
     assert.ok(second.db.pragma("table_info(transfer_items)").some((column) => column.name === "home_reused"));
@@ -113,6 +127,195 @@ test("existing v1 lifecycle state upgrades to reuse tracking without losing jobs
     second.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("streaming manifests accept a complete run larger than the legacy 100 item request", async () => {
+  await withStore(({ store }) => {
+    const expectedCount = 250;
+    const run = store.createStreamingJob({
+      id: "streaming-run-250",
+      mediaKind: "WORKFLOW_UPLOAD",
+      expectedCount,
+      manifestUrl: "https://api.example.test/internal/media-runs/streaming-run-250/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/media-runs/streaming-run-250/results",
+      callbackToken: "callback-token",
+    });
+    assert.equal(run.status, "INGESTING");
+    assert.ok(store.claimManifestRun(run.id));
+
+    const items = Array.from({ length: expectedCount }, (_, index) => ({
+      lifecycleObjectId: `object-${index}`,
+      objectKey: `New-Waule/uploads/2026/07/${index}.png`,
+      sourceUrl: `https://api.example.test/local-media/New-Waule/uploads/2026/07/${index}.png`,
+      targetTier: "COLD_HOME_MINIO",
+      expectedSizeBytes: index + 1,
+      mimeType: "image/png",
+    }));
+    store.appendManifestItems(run.id, items.slice(0, 125));
+    store.appendManifestItems(run.id, items.slice(125));
+    const sealed = store.completeManifest(run.id);
+
+    assert.equal(sealed.manifestStatus, "SEALED");
+    assert.equal(sealed.totalCount, expectedCount);
+    assert.equal(sealed.manifestAcceptedCount, expectedCount);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM transfer_items WHERE job_id = ?").get(run.id).count, expectedCount);
+  });
+});
+
+test("a cancelled partial manifest resumes every already-ingested item", async () => {
+  await withStore(({ store }) => {
+    const run = store.createStreamingJob({
+      id: "streaming-partial-resume",
+      mediaKind: "WORKFLOW_UPLOAD",
+      expectedCount: 2,
+      manifestUrl: "https://api.example.test/internal/media-runs/streaming-partial-resume/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/media-runs/streaming-partial-resume/results",
+      callbackToken: "callback-token",
+    });
+    store.claimManifestRun(run.id);
+    store.appendManifestItems(run.id, [{
+      lifecycleObjectId: "partial-object-1",
+      objectKey: "New-Waule/uploads/2026/07/partial-1.png",
+      sourceUrl: "https://api.example.test/local-media/New-Waule/uploads/2026/07/partial-1.png",
+      targetTier: "COLD_HOME_MINIO",
+      expectedSizeBytes: 12,
+    }]);
+
+    store.cancelJob(run.id, "Cancelled while reading manifest", true);
+    assert.equal(store.getJob(run.id).items[0].status, "CANCELLED");
+
+    const resumed = store.resumeStreamingJob(run.id);
+    assert.equal(resumed.status, "INGESTING");
+    assert.equal(resumed.manifestStatus, "PENDING");
+    assert.equal(store.getJob(run.id).items[0].status, "QUEUED");
+
+    store.claimManifestRun(run.id);
+    store.appendManifestItems(run.id, [
+      {
+        lifecycleObjectId: "partial-object-1",
+        objectKey: "New-Waule/uploads/2026/07/partial-1.png",
+        sourceUrl: "https://api.example.test/local-media/New-Waule/uploads/2026/07/partial-1.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: 12,
+      },
+      {
+        lifecycleObjectId: "partial-object-2",
+        objectKey: "New-Waule/uploads/2026/07/partial-2.png",
+        sourceUrl: "https://api.example.test/local-media/New-Waule/uploads/2026/07/partial-2.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: 18,
+      },
+    ]);
+    const sealed = store.completeManifest(run.id);
+    assert.equal(sealed.totalCount, 2);
+    assert.deepEqual(store.getJob(run.id).items.map((item) => item.status), ["QUEUED", "QUEUED"]);
+    assert.equal(store.listRunnableItems().length, 2);
+  });
+});
+
+test("manifest ingestion and callback delivery recover after process restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "home-minio-stream-recovery-"));
+  const dbPath = join(root, "state.sqlite");
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
+  const run = first.createStreamingJob({
+    id: "streaming-recovery",
+    mediaKind: "GENERATED_MEDIA",
+    expectedCount: 1,
+    manifestUrl: "https://api.example.test/internal/media-runs/streaming-recovery/manifest",
+    manifestToken: "manifest-token",
+    callbackUrl: "https://api.example.test/internal/media-runs/streaming-recovery/results",
+    callbackToken: "callback-token",
+  });
+  first.claimManifestRun(run.id);
+  first.appendManifestItems(run.id, [{
+    lifecycleObjectId: "object-recovery",
+    objectKey: "gateway-media/recovery.png",
+    sourceUrl: "https://api.example.test/local-media/gateway-media/recovery.png",
+    targetTier: "COLD_HOME_MINIO",
+    expectedSizeBytes: 8,
+    mimeType: "image/png",
+  }]);
+  const itemId = first.db.prepare("SELECT id FROM transfer_items WHERE job_id = ?").get(run.id).id;
+  first.updateItem(itemId, {
+    status: "FAILED",
+    stage: "FAILED",
+    failureKind: "SOURCE_MISSING",
+    failureStatusCode: 404,
+    retryable: false,
+    error: "Source download failed with HTTP 404.",
+    finishedAt: new Date().toISOString(),
+  });
+  const callback = first.enqueueItemCallback(itemId);
+  first.db.prepare("UPDATE callback_outbox SET status = 'SENDING' WHERE id = ?").run(callback.id);
+  first.close();
+
+  const second = new LifecycleStore({ dbPath, encryptionKey: null });
+  try {
+    const recovered = second.getJobSummary(run.id);
+    assert.equal(recovered.status, "INGESTING");
+    assert.equal(recovered.manifestStatus, "RETRY_WAIT");
+    assert.deepEqual(second.listManifestRuns(), [run.id]);
+    const callbacks = second.listRunnableCallbacks();
+    assert.equal(callbacks.length, 1);
+    assert.equal(callbacks[0].status, "RETRY_WAIT");
+    assert.equal(callbacks[0].payload.failureKind, "SOURCE_MISSING");
+  } finally {
+    second.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exhausted callbacks are visible and can be resumed without rerunning completed transfers", async () => {
+  await withStore(({ store }) => {
+    const run = store.createStreamingJob({
+      id: "streaming-callback-resume",
+      mediaKind: "GENERATED_MEDIA",
+      expectedCount: 1,
+      manifestUrl: "https://api.example.test/internal/media-runs/streaming-callback-resume/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/media-runs/streaming-callback-resume/results",
+      callbackToken: "callback-token",
+    });
+    store.claimManifestRun(run.id);
+    store.appendManifestItems(run.id, [{
+      lifecycleObjectId: "callback-object",
+      objectKey: "gateway-media/callback-object.png",
+      sourceUrl: "https://api.example.test/local-media/gateway-media/callback-object.png",
+      targetTier: "COLD_HOME_MINIO",
+      expectedSizeBytes: 8,
+    }]);
+    store.completeManifest(run.id);
+    const itemId = store.db.prepare("SELECT id FROM transfer_items WHERE job_id = ?").get(run.id).id;
+    store.updateItem(itemId, {
+      status: "SUCCEEDED",
+      stage: "COMPLETED",
+      homeSizeBytes: 8,
+      homeSha256: "a".repeat(64),
+      homeVerifiedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    });
+    const callback = store.enqueueItemCallback(itemId);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      assert.equal(store.claimCallbacks([callback.id]).length, 1);
+      store.markCallbacksRetry([callback.id], "NewWaule callback unavailable");
+    }
+
+    const failed = store.getJobSummary(run.id);
+    assert.equal(failed.status, "SUCCEEDED");
+    assert.equal(failed.callbackTotalCount, 1);
+    assert.equal(failed.callbackDeliveredCount, 0);
+    assert.equal(failed.callbackPendingCount, 0);
+    assert.equal(failed.callbackFailedCount, 1);
+
+    const resumed = store.resumeStreamingJob(run.id);
+    assert.equal(resumed.status, "SUCCEEDED");
+    assert.equal(resumed.callbackFailedCount, 0);
+    assert.equal(resumed.callbackPendingCount, 1);
+    assert.equal(store.listRunnableCallbacks()[0].id, callback.id);
+    assert.equal(store.getJob(run.id).items[0].status, "SUCCEEDED");
+  });
 });
 
 test("lifecycle state reopens without an external encryption key", async () => {

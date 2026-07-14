@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import OSS from "ali-oss";
@@ -13,10 +14,11 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 410]);
 
 export class PermanentLifecycleTransferError extends Error {
-  constructor(message, statusCode = null) {
+  constructor(message, statusCode = null, failureKind = null) {
     super(message);
     this.name = "PermanentLifecycleTransferError";
     this.statusCode = statusCode;
+    this.failureKind = failureKind;
   }
 }
 
@@ -24,6 +26,28 @@ export function isPermanentLifecycleTransferError(error) {
   if (error instanceof PermanentLifecycleTransferError) return true;
   const status = Number(error?.status ?? error?.statusCode ?? error?.$metadata?.httpStatusCode);
   return Number.isInteger(status) && PERMANENT_HTTP_STATUSES.has(status);
+}
+
+function lifecycleFailureDetails(error) {
+  const statusCode = Number(error?.status ?? error?.statusCode ?? error?.$metadata?.httpStatusCode);
+  const normalizedStatus = Number.isInteger(statusCode) ? statusCode : null;
+  if (error?.failureKind) {
+    return { kind: String(error.failureKind), statusCode: normalizedStatus, retryable: false };
+  }
+  if (normalizedStatus === 404 || normalizedStatus === 410) {
+    return { kind: "SOURCE_MISSING", statusCode: normalizedStatus, retryable: false };
+  }
+  if (normalizedStatus === 401 || normalizedStatus === 403) {
+    return { kind: "ACCESS_DENIED", statusCode: normalizedStatus, retryable: false };
+  }
+  if (normalizedStatus === 400) {
+    return { kind: "SOURCE_INVALID", statusCode: normalizedStatus, retryable: false };
+  }
+  return {
+    kind: isPermanentLifecycleTransferError(error) ? "TRANSFER_REJECTED" : "TRANSFER_RETRYABLE",
+    statusCode: normalizedStatus,
+    retryable: !isPermanentLifecycleTransferError(error),
+  };
 }
 
 function combinedSignal(signal, timeoutMs) {
@@ -83,6 +107,20 @@ export function sourceUrlMatchesObjectKey(sourceUrl, objectKey) {
   } catch {
     return false;
   }
+}
+
+export function takeContiguousCallbackBatch(callbacks, limit = 100) {
+  const first = callbacks[0];
+  if (!first) return [];
+  const batch = [first];
+  const maxItems = Math.max(1, Math.min(100, limit));
+  for (const callback of callbacks.slice(1)) {
+    if (batch.length >= maxItems) break;
+    const previous = batch[batch.length - 1];
+    if (callback.runId !== first.runId || callback.sequence !== previous.sequence + 1) break;
+    batch.push(callback);
+  }
+  return batch;
 }
 
 function nodeReadable(body) {
@@ -184,6 +222,8 @@ export class LifecycleTransferService {
     this.activeItemIds = new Set();
     this.activeObjectKeys = new Set();
     this.activeTransfers = new Map();
+    this.activeManifestRuns = new Map();
+    this.activeCallbackRuns = new Set();
     this.pendingEnvironment = null;
     this.byteSamples = [];
     this.timer = null;
@@ -296,7 +336,13 @@ export class LifecycleTransferService {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    while (this.activeItemIds.size > 0) await delay(50);
+    for (const controller of this.activeManifestRuns.values()) {
+      controller.abort(new Error("Lifecycle service is stopping."));
+    }
+    for (const transfer of this.activeTransfers.values()) {
+      transfer.controller.abort(new Error("Lifecycle service is stopping."));
+    }
+    while (this.activeItemIds.size > 0 || this.activeManifestRuns.size > 0 || this.activeCallbackRuns.size > 0) await delay(50);
     this.minioClient.destroy?.();
   }
 
@@ -308,6 +354,8 @@ export class LifecycleTransferService {
       console.error(`[home-minio] lifecycle configuration refresh failed: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
+    this.kickManifestRuns();
+    this.kickCallbacks();
     const available = Math.max(0, this.maxHttpConcurrency - this.activeItemIds.size);
     if (!available) return;
     const runnable = this.store.listRunnableItems(available * 2);
@@ -337,6 +385,122 @@ export class LifecycleTransferService {
     return job;
   }
 
+  async submitStreamingJob(payload) {
+    await this.refreshEnvironment();
+    const job = this.store.createStreamingJob(payload);
+    if (!this.stopped) this.kickManifestRuns();
+    return job;
+  }
+
+  getJobSummary(id) {
+    return this.store.getJobSummary(id);
+  }
+
+  kickManifestRuns() {
+    if (this.stopped) return;
+    for (const runId of this.store.listManifestRuns(4)) {
+      if (this.activeManifestRuns.has(runId)) continue;
+      const controller = new AbortController();
+      this.activeManifestRuns.set(runId, controller);
+      void this.ingestManifest(runId, controller.signal)
+        .catch((error) => console.error(`[home-minio] lifecycle manifest ${runId} failed: ${error instanceof Error ? error.message : String(error)}`))
+        .finally(() => {
+          this.activeManifestRuns.delete(runId);
+          if (!this.stopped) queueMicrotask(() => void this.kick());
+        });
+    }
+  }
+
+  async ingestManifest(runId, signal) {
+    const control = this.store.claimManifestRun(runId);
+    if (!control) return;
+    try {
+      throwIfAborted(signal);
+      const response = await this.fetch(control.manifest_url, {
+        headers: { "x-media-manifest-token": control.manifest_token },
+        redirect: "follow",
+        signal: combinedSignal(signal, DEFAULT_REQUEST_TIMEOUT_MS),
+      });
+      if (!response.ok || !response.body) {
+        throw new PermanentLifecycleTransferError(
+          `Manifest download failed with HTTP ${response.status}.`,
+          response.status,
+          response.status === 404 || response.status === 410 ? "MANIFEST_MISSING" : "MANIFEST_REJECTED",
+        );
+      }
+      const reader = createInterface({ input: nodeReadable(response.body), crlfDelay: Infinity });
+      let batch = [];
+      for await (const rawLine of reader) {
+        throwIfAborted(signal);
+        const line = String(rawLine).trim();
+        if (!line) continue;
+        if (line.length > 2 * 1024 * 1024) throw new PermanentLifecycleTransferError("Manifest line exceeds 2 MiB.", 400, "MANIFEST_INVALID");
+        let item;
+        try {
+          item = JSON.parse(line);
+        } catch {
+          throw new PermanentLifecycleTransferError("Manifest contains invalid JSON.", 400, "MANIFEST_INVALID");
+        }
+        batch.push(item);
+        if (batch.length >= 500) {
+          this.store.appendManifestItems(runId, batch);
+          batch = [];
+        }
+      }
+      if (batch.length) this.store.appendManifestItems(runId, batch);
+      this.store.completeManifest(runId);
+    } catch (error) {
+      const details = lifecycleFailureDetails(error);
+      this.store.failManifest(runId, error instanceof Error ? error.message : String(error), details.retryable);
+      throw error;
+    }
+  }
+
+  kickCallbacks() {
+    if (this.stopped) return;
+    const runnable = this.store.listRunnableCallbacks(100);
+    const first = runnable.find((item) => !this.activeCallbackRuns.has(item.runId));
+    if (!first) return;
+    const group = takeContiguousCallbackBatch(
+      runnable.filter((item) => item.runId === first.runId),
+      100,
+    );
+    const claimed = this.store.claimCallbacks(group.map((item) => item.id));
+    if (!claimed.length) return;
+    this.activeCallbackRuns.add(first.runId);
+    void this.deliverCallbacks(claimed)
+      .catch((error) => console.warn(`[home-minio] lifecycle callback ${first.runId} failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => {
+        this.activeCallbackRuns.delete(first.runId);
+        if (!this.stopped) queueMicrotask(() => this.kickCallbacks());
+      });
+  }
+
+  async deliverCallbacks(callbacks) {
+    const first = callbacks[0];
+    try {
+      const response = await this.fetch(first.callbackUrl, {
+        method: "POST",
+        signal: AbortSignal.timeout(30_000),
+        headers: {
+          "content-type": "application/json",
+          "x-home-minio-token": first.callbackToken,
+        },
+        body: JSON.stringify({
+          runId: first.runId,
+          fromSequence: callbacks[0].sequence,
+          toSequence: callbacks[callbacks.length - 1].sequence,
+          items: callbacks.map((callback) => ({ sequence: callback.sequence, result: callback.payload })),
+        }),
+      });
+      if (!response.ok) throw new Error(`NewWaule callback failed with HTTP ${response.status}.`);
+      this.store.markCallbacksDelivered(callbacks.map((item) => item.id));
+    } catch (error) {
+      this.store.markCallbacksRetry(callbacks.map((item) => item.id), error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
   getJob(id) {
     return this.store.getJob(id);
   }
@@ -344,14 +508,31 @@ export class LifecycleTransferService {
   cancelJob(id) {
     const job = this.store.cancelJob(id);
     if (!job) return null;
+    this.activeManifestRuns.get(id)?.abort(new Error("Lifecycle job cancelled."));
     for (const transfer of this.activeTransfers.values()) {
       if (transfer.jobId === id) transfer.controller.abort(new Error("Lifecycle job cancelled."));
     }
     return this.store.getJob(id);
   }
 
+  cancelStreamingJob(id) {
+    const job = this.store.cancelJob(id, "Cancelled by administrator", true);
+    if (!job) return null;
+    this.activeManifestRuns.get(id)?.abort(new Error("Lifecycle job cancelled."));
+    for (const transfer of this.activeTransfers.values()) {
+      if (transfer.jobId === id) transfer.controller.abort(new Error("Lifecycle job cancelled."));
+    }
+    return this.store.getJobSummary(id);
+  }
+
   resumeJob(id) {
     const job = this.store.resumeJob(id);
+    if (job && !this.stopped) void this.kick();
+    return job;
+  }
+
+  resumeStreamingJob(id) {
+    const job = this.store.resumeStreamingJob(id);
     if (job && !this.stopped) void this.kick();
     return job;
   }
@@ -381,7 +562,7 @@ export class LifecycleTransferService {
       }
     }
     if (!sourceUrlMatchesObjectKey(item.sourceUrl, item.objectKey)) {
-      throw new PermanentLifecycleTransferError("Source URL path does not match objectKey.");
+      throw new PermanentLifecycleTransferError("Source URL path does not match objectKey.", 400, "SOURCE_URL_MISMATCH");
     }
 
     const copied = await this.pullSemaphore.use(() => this.httpSemaphore.use(async () => {
@@ -392,16 +573,24 @@ export class LifecycleTransferService {
       if (!response.ok || !response.body) {
         const message = `Source download failed with HTTP ${response.status}.`;
         if (PERMANENT_HTTP_STATUSES.has(response.status)) {
-          throw new PermanentLifecycleTransferError(message, response.status);
+          throw new PermanentLifecycleTransferError(
+            message,
+            response.status,
+            response.status === 404 || response.status === 410 ? "SOURCE_MISSING" : "SOURCE_ACCESS_REJECTED",
+          );
         }
         throw new Error(message);
       }
       const contentLength = Number(response.headers.get("content-length"));
       if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
-        throw new PermanentLifecycleTransferError("Source response is missing a valid Content-Length.");
+        throw new PermanentLifecycleTransferError("Source response is missing a valid Content-Length.", 400, "SOURCE_METADATA_INVALID");
       }
       if (item.expectedSizeBytes != null && contentLength !== item.expectedSizeBytes) {
-        throw new PermanentLifecycleTransferError(`Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`);
+        throw new PermanentLifecycleTransferError(
+          `Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`,
+          400,
+          "CONTENT_MISMATCH",
+        );
       }
 
       const hash = createHash("sha256");
@@ -426,7 +615,7 @@ export class LifecycleTransferService {
       }
       const sha256 = hash.digest("hex");
       if (item.expectedSha256 && sha256 !== item.expectedSha256) {
-        throw new PermanentLifecycleTransferError("Source SHA-256 does not match the expected checksum.");
+        throw new PermanentLifecycleTransferError("Source SHA-256 does not match the expected checksum.", 400, "CONTENT_MISMATCH");
       }
       return { contentLength, uploadEtag: normalizeEtag(upload.etag), sha256 };
     }, 2));
@@ -677,6 +866,8 @@ export class LifecycleTransferService {
           checkpoint: null,
           finishedAt: new Date().toISOString(),
         });
+        this.store.enqueueItemCallback(item.id);
+        this.kickCallbacks();
         return;
       }
 
@@ -698,6 +889,8 @@ export class LifecycleTransferService {
         warning: oss.warning,
         finishedAt: new Date().toISOString(),
       });
+      this.store.enqueueItemCallback(item.id);
+      this.kickCallbacks();
     } catch (error) {
       if (controller.signal.aborted || this.store.isItemCancelled(item.id)) return;
       let ossConfig = null;
@@ -719,16 +912,23 @@ export class LifecycleTransferService {
           ossConfig?.accessKeySecret,
         ],
       );
-      const permanent = isPermanentLifecycleTransferError(error);
-      const failed = permanent || item.attemptCount >= MAX_ATTEMPTS;
+      const failure = lifecycleFailureDetails(error);
+      const failed = !failure.retryable || item.attemptCount >= MAX_ATTEMPTS;
       const nextRetryAt = failed ? null : this.retryAt(item.attemptCount);
       this.store.updateItem(item.id, {
         status: failed ? "FAILED" : "RETRY_WAIT",
         stage: failed ? "FAILED" : "RETRY_WAIT",
         nextRetryAt,
         error: message.slice(0, 4000),
+        failureKind: failure.kind,
+        failureStatusCode: failure.statusCode,
+        retryable: failed ? false : true,
         finishedAt: failed ? new Date().toISOString() : null,
       });
+      if (failed) {
+        this.store.enqueueItemCallback(item.id);
+        this.kickCallbacks();
+      }
       const level = failed ? "error" : "warn";
       console[level](`[home-minio] lifecycle item ${item.id} ${failed ? "failed" : `retry at ${nextRetryAt}`}: ${message}`);
     } finally {

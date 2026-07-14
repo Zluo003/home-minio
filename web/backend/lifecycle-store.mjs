@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 3;
 const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
@@ -135,6 +135,45 @@ function requestFingerprint(payload) {
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
 
+function normalizeMediaKind(value) {
+  return value === "WORKFLOW_UPLOAD" ? "WORKFLOW_UPLOAD" : value === "GENERATED_MEDIA" ? "GENERATED_MEDIA" : "";
+}
+
+function normalizeHttpUrl(value, label) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid protocol");
+    return parsed.toString();
+  } catch {
+    throw new LifecycleValidationError(`${label} must be a valid HTTP URL.`);
+  }
+}
+
+function normalizeLifecycleItem(item, index = 0) {
+  const lifecycleObjectId = String(item?.lifecycleObjectId || "").trim();
+  const objectKey = String(item?.objectKey || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  const targetTier = item?.targetTier === "WARM_OSS" ? "WARM_OSS" : item?.targetTier === "COLD_HOME_MINIO" ? "COLD_HOME_MINIO" : "";
+  if (!lifecycleObjectId || !objectKey || objectKey.split("/").some((segment) => !segment || segment === "." || segment === "..") || !targetTier) {
+    throw new LifecycleValidationError(`Lifecycle item ${index + 1} is invalid.`);
+  }
+  const sourceUrl = normalizeHttpUrl(item?.sourceUrl, `Lifecycle item ${index + 1} sourceUrl`);
+  const expectedSizeBytes = item?.expectedSizeBytes == null ? null : Number(item.expectedSizeBytes);
+  if (expectedSizeBytes !== null && (!Number.isSafeInteger(expectedSizeBytes) || expectedSizeBytes < 0)) {
+    throw new LifecycleValidationError(`Lifecycle item ${index + 1} expectedSizeBytes is invalid.`);
+  }
+  return {
+    lifecycleObjectId,
+    objectKey,
+    sourceUrl,
+    targetTier,
+    expectedSizeBytes,
+    expectedSha256: typeof item?.expectedSha256 === "string" && /^[a-f\d]{64}$/i.test(item.expectedSha256)
+      ? item.expectedSha256.toLowerCase()
+      : null,
+    mimeType: typeof item?.mimeType === "string" && item.mimeType.trim() ? item.mimeType.trim().slice(0, 191) : null,
+  };
+}
+
 function parseJson(value, fallback = null) {
   if (!value) return fallback;
   try {
@@ -197,6 +236,9 @@ function serializeItem(row) {
       : null,
     warning: row.warning,
     error: row.error,
+    failureKind: row.failure_kind || null,
+    failureStatusCode: row.failure_status_code ?? null,
+    retryable: row.retryable == null ? null : Boolean(row.retryable),
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     updatedAt: row.updated_at,
@@ -217,11 +259,32 @@ function serializeJob(row, items = []) {
     totalBytes: row.total_bytes,
     processedBytes: row.processed_bytes,
     error: row.error,
+    manifestStatus: row.manifest_status || "SEALED",
+    expectedCount: row.expected_count ?? row.total_count,
+    manifestAcceptedCount: row.manifest_accepted_count ?? row.total_count,
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     updatedAt: row.updated_at,
     items,
+  };
+}
+
+function serializeCallback(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    runId: row.run_id,
+    itemId: row.item_id,
+    sequence: row.sequence,
+    status: row.status,
+    payload: parseJson(row.payload_json, {}),
+    attemptCount: row.attempt_count,
+    nextRetryAt: row.next_retry_at,
+    error: row.error,
+    createdAt: row.created_at,
+    deliveredAt: row.delivered_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -408,13 +471,65 @@ export class LifecycleStore {
       current = 1;
     }
     if (current < 2) {
-      this.db.exec("ALTER TABLE transfer_items ADD COLUMN home_reused INTEGER;");
-      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, nowIso());
+      this.db.transaction(() => {
+        this.db.exec("ALTER TABLE transfer_items ADD COLUMN home_reused INTEGER;");
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, nowIso());
+      })();
+      current = 2;
+    }
+    if (current < 3) {
+      this.db.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE transfer_jobs ADD COLUMN manifest_url TEXT;
+          ALTER TABLE transfer_jobs ADD COLUMN manifest_token TEXT;
+          ALTER TABLE transfer_jobs ADD COLUMN callback_url TEXT;
+          ALTER TABLE transfer_jobs ADD COLUMN callback_token TEXT;
+          ALTER TABLE transfer_jobs ADD COLUMN manifest_status TEXT NOT NULL DEFAULT 'SEALED';
+          ALTER TABLE transfer_jobs ADD COLUMN expected_count INTEGER;
+          ALTER TABLE transfer_jobs ADD COLUMN manifest_accepted_count INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE transfer_jobs ADD COLUMN manifest_attempt_count INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE transfer_jobs ADD COLUMN manifest_next_retry_at TEXT;
+          ALTER TABLE transfer_jobs ADD COLUMN last_callback_sequence INTEGER NOT NULL DEFAULT 0;
+
+          ALTER TABLE transfer_items ADD COLUMN failure_kind TEXT;
+          ALTER TABLE transfer_items ADD COLUMN failure_status_code INTEGER;
+          ALTER TABLE transfer_items ADD COLUMN retryable INTEGER;
+
+          CREATE TABLE callback_outbox (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES transfer_jobs(id) ON DELETE CASCADE,
+            item_id TEXT NOT NULL REFERENCES transfer_items(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(run_id, item_id),
+            UNIQUE(run_id, sequence)
+          );
+
+          CREATE INDEX callback_outbox_runnable_idx
+            ON callback_outbox(status, next_retry_at, created_at);
+          CREATE INDEX transfer_jobs_manifest_runnable_idx
+            ON transfer_jobs(manifest_status, manifest_next_retry_at, created_at);
+        `);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(3, nowIso());
+      })();
     }
   }
 
   recoverInterruptedWork() {
     const now = nowIso();
+    this.db.prepare(`
+      UPDATE transfer_jobs
+      SET manifest_status = 'RETRY_WAIT', manifest_next_retry_at = ?, status = 'INGESTING',
+          error = COALESCE(error, 'Recovered manifest ingestion after process restart'), updated_at = ?
+      WHERE manifest_status = 'FETCHING'
+    `).run(now, now);
     this.db.prepare(`
       UPDATE transfer_items
       SET status = 'RETRY_WAIT', next_retry_at = ?, error = COALESCE(error, 'Recovered after process restart'), updated_at = ?
@@ -430,6 +545,11 @@ export class LifecycleStore {
       SET status = 'QUEUED', next_retry_at = NULL, error = COALESCE(error, 'Recovered after process restart'), updated_at = ?
       WHERE status = 'RUNNING'
     `).run(now);
+    this.db.prepare(`
+      UPDATE callback_outbox
+      SET status = 'RETRY_WAIT', next_retry_at = ?, error = COALESCE(error, 'Recovered after process restart'), updated_at = ?
+      WHERE status = 'SENDING'
+    `).run(now, now);
   }
 
   close() {
@@ -497,12 +617,205 @@ export class LifecycleStore {
     return deserializeConfigPayload(row.encrypted_payload, this.legacyEncryptionKey);
   }
 
+  createStreamingJob(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new LifecycleValidationError("Lifecycle run payload is required.");
+    }
+    const id = String(input.id || "").trim();
+    const mediaKind = normalizeMediaKind(input.mediaKind);
+    const configVersionId = input.configVersionId ? String(input.configVersionId).trim() : null;
+    const expectedCount = Number(input.expectedCount);
+    if (!id || id.length > 191 || !mediaKind || !Number.isSafeInteger(expectedCount) || expectedCount < 0) {
+      throw new LifecycleValidationError("Lifecycle run requires a valid id, mediaKind and expectedCount.");
+    }
+    if (configVersionId && !this.getConfigVersion(configVersionId)) {
+      throw new LifecycleValidationError("OSS config version not found.", 404);
+    }
+    const manifestUrl = normalizeHttpUrl(input.manifestUrl, "manifestUrl");
+    const callbackUrl = normalizeHttpUrl(input.callbackUrl, "callbackUrl");
+    const manifestToken = String(input.manifestToken || "").trim();
+    const callbackToken = String(input.callbackToken || "").trim();
+    if (!manifestToken || manifestToken.length > 4096 || !callbackToken || callbackToken.length > 4096) {
+      throw new LifecycleValidationError("Lifecycle run tokens are required.");
+    }
+    const normalizedRequest = { id, mediaKind, configVersionId, expectedCount, manifestUrl, callbackUrl };
+    const fingerprint = requestFingerprint(normalizedRequest);
+    const existing = this.db.prepare("SELECT * FROM transfer_jobs WHERE id = ?").get(id);
+    if (existing) {
+      if (existing.request_fingerprint !== fingerprint) {
+        throw new LifecycleConflictError("Lifecycle run id already exists with different metadata.");
+      }
+      return this.getJobSummary(id);
+    }
+
+    const createdAt = nowIso();
+    this.db.prepare(`
+      INSERT INTO transfer_jobs(
+        id, request_fingerprint, media_kind, config_version_id, status,
+        total_count, total_bytes, manifest_url, manifest_token, callback_url, callback_token,
+        manifest_status, expected_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'INGESTING', 0, 0, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+    `).run(
+      id,
+      fingerprint,
+      mediaKind,
+      configVersionId,
+      manifestUrl,
+      manifestToken,
+      callbackUrl,
+      callbackToken,
+      expectedCount,
+      createdAt,
+      createdAt,
+    );
+    return this.getJobSummary(id);
+  }
+
+  getJobSummary(id) {
+    const job = serializeJob(this.db.prepare("SELECT * FROM transfer_jobs WHERE id = ?").get(id));
+    return job ? { ...job, ...this.getCallbackDeliverySummary(id) } : null;
+  }
+
+  getCallbackDeliverySummary(runId) {
+    const row = this.db.prepare(`
+      SELECT
+        COUNT(*) AS callback_total_count,
+        SUM(CASE WHEN status = 'DELIVERED' THEN 1 ELSE 0 END) AS callback_delivered_count,
+        SUM(CASE WHEN status IN ('QUEUED', 'SENDING', 'RETRY_WAIT') THEN 1 ELSE 0 END) AS callback_pending_count,
+        SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS callback_failed_count
+      FROM callback_outbox
+      WHERE run_id = ?
+    `).get(runId);
+    return {
+      callbackTotalCount: Number(row?.callback_total_count || 0),
+      callbackDeliveredCount: Number(row?.callback_delivered_count || 0),
+      callbackPendingCount: Number(row?.callback_pending_count || 0),
+      callbackFailedCount: Number(row?.callback_failed_count || 0),
+    };
+  }
+
+  getJobControl(id) {
+    return this.db.prepare("SELECT * FROM transfer_jobs WHERE id = ?").get(id) || null;
+  }
+
+  listManifestRuns(limit = 10) {
+    return this.db.prepare(`
+      SELECT id FROM transfer_jobs
+      WHERE manifest_status = 'PENDING'
+         OR (manifest_status = 'RETRY_WAIT' AND (manifest_next_retry_at IS NULL OR manifest_next_retry_at <= ?))
+      ORDER BY created_at, id
+      LIMIT ?
+    `).all(nowIso(), Math.max(1, Math.min(100, limit))).map((row) => row.id);
+  }
+
+  claimManifestRun(id) {
+    const now = nowIso();
+    const result = this.db.prepare(`
+      UPDATE transfer_jobs
+      SET manifest_status = 'FETCHING', status = 'INGESTING', manifest_attempt_count = manifest_attempt_count + 1,
+          manifest_next_retry_at = NULL, error = NULL, started_at = COALESCE(started_at, ?), updated_at = ?
+      WHERE id = ? AND (manifest_status = 'PENDING' OR manifest_status = 'RETRY_WAIT')
+    `).run(now, now, id);
+    return result.changes ? this.getJobControl(id) : null;
+  }
+
+  appendManifestItems(runId, rawItems) {
+    const job = this.getJobControl(runId);
+    if (!job || job.manifest_status !== "FETCHING") {
+      throw new LifecycleConflictError("Lifecycle manifest is not accepting items.");
+    }
+    const items = Array.isArray(rawItems) ? rawItems.map((item, index) => normalizeLifecycleItem(item, index)) : [];
+    if (!items.length) return this.getJobSummary(runId);
+    if (items.some((item) => item.targetTier === "WARM_OSS") && !job.config_version_id) {
+      throw new LifecycleValidationError("WARM_OSS items require configVersionId.");
+    }
+    const insertedAt = nowIso();
+    this.db.transaction(() => {
+      const find = this.db.prepare("SELECT * FROM transfer_items WHERE job_id = ? AND lifecycle_object_id = ?");
+      const insert = this.db.prepare(`
+        INSERT INTO transfer_items(
+          id, job_id, lifecycle_object_id, object_key, source_url, target_tier,
+          expected_size_bytes, expected_sha256, mime_type, status, stage, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', ?, ?)
+      `);
+      for (const item of items) {
+        const existing = find.get(runId, item.lifecycleObjectId);
+        if (existing) {
+          const same = existing.object_key === item.objectKey
+            && existing.source_url === item.sourceUrl
+            && existing.target_tier === item.targetTier
+            && existing.expected_size_bytes === item.expectedSizeBytes
+            && existing.expected_sha256 === item.expectedSha256
+            && existing.mime_type === item.mimeType;
+          if (!same) throw new LifecycleConflictError(`Manifest item ${item.lifecycleObjectId} changed during retry.`);
+          continue;
+        }
+        insert.run(
+          randomUUID(), runId, item.lifecycleObjectId, item.objectKey, item.sourceUrl, item.targetTier,
+          item.expectedSizeBytes, item.expectedSha256, item.mimeType, insertedAt, insertedAt,
+        );
+      }
+      const totals = this.db.prepare(`
+        SELECT COUNT(*) AS count, COALESCE(SUM(COALESCE(expected_size_bytes, 0)), 0) AS bytes
+        FROM transfer_items WHERE job_id = ?
+      `).get(runId);
+      this.db.prepare(`
+        UPDATE transfer_jobs
+        SET total_count = ?, total_bytes = ?, manifest_accepted_count = ?, updated_at = ?
+        WHERE id = ?
+      `).run(totals.count, totals.bytes, totals.count, nowIso(), runId);
+    })();
+    return this.getJobSummary(runId);
+  }
+
+  completeManifest(runId) {
+    const job = this.getJobControl(runId);
+    if (!job || job.manifest_status !== "FETCHING") return this.getJobSummary(runId);
+    const actualCount = this.db.prepare("SELECT COUNT(*) AS count FROM transfer_items WHERE job_id = ?").get(runId).count;
+    if (job.expected_count !== null && actualCount !== job.expected_count) {
+      throw new LifecycleValidationError(`Manifest count mismatch: expected ${job.expected_count}, received ${actualCount}.`);
+    }
+    const now = nowIso();
+    this.db.prepare(`
+      UPDATE transfer_jobs
+      SET manifest_status = 'SEALED', status = ?, manifest_accepted_count = ?,
+          finished_at = CASE WHEN ? = 0 THEN ? ELSE NULL END, updated_at = ?
+      WHERE id = ?
+    `).run(actualCount === 0 ? "SUCCEEDED" : "QUEUED", actualCount, actualCount, now, now, runId);
+    return this.getJobSummary(runId);
+  }
+
+  failManifest(runId, error, retryable = true) {
+    const job = this.getJobControl(runId);
+    if (!job) return null;
+    if (job.manifest_status === "CANCELLED") return this.getJobSummary(runId);
+    const exhausted = !retryable || job.manifest_attempt_count >= 10;
+    const delayMs = Math.min(6 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, job.manifest_attempt_count - 1));
+    const now = nowIso();
+    this.db.prepare(`
+      UPDATE transfer_jobs
+      SET manifest_status = ?, status = ?, manifest_next_retry_at = ?, error = ?,
+          finished_at = CASE WHEN ? THEN ? ELSE NULL END, updated_at = ?
+      WHERE id = ?
+    `).run(
+      exhausted ? "FAILED" : "RETRY_WAIT",
+      exhausted ? "FAILED" : "INGESTING",
+      exhausted ? null : new Date(Date.now() + delayMs).toISOString(),
+      String(error || "Manifest ingestion failed").slice(0, 4000),
+      exhausted ? 1 : 0,
+      now,
+      now,
+      runId,
+    );
+    return this.getJobSummary(runId);
+  }
+
   createJob(input) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new LifecycleValidationError("Lifecycle job payload is required.");
     }
     const id = String(input.id || "").trim();
-    const mediaKind = input.mediaKind === "WORKFLOW_UPLOAD" ? "WORKFLOW_UPLOAD" : input.mediaKind === "GENERATED_MEDIA" ? "GENERATED_MEDIA" : "";
+    const mediaKind = normalizeMediaKind(input.mediaKind);
     const configVersionId = input.configVersionId ? String(input.configVersionId).trim() : null;
     const items = Array.isArray(input.items) ? input.items : [];
     if (!id || id.length > 191 || !mediaKind || items.length < 1 || items.length > 100) {
@@ -515,37 +828,7 @@ export class LifecycleStore {
       throw new LifecycleValidationError("OSS config version not found.", 404);
     }
 
-    const normalizedItems = items.map((item, index) => {
-      const lifecycleObjectId = String(item?.lifecycleObjectId || "").trim();
-      const objectKey = String(item?.objectKey || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
-      const sourceUrl = String(item?.sourceUrl || "").trim();
-      const targetTier = item?.targetTier === "WARM_OSS" ? "WARM_OSS" : item?.targetTier === "COLD_HOME_MINIO" ? "COLD_HOME_MINIO" : "";
-      if (!lifecycleObjectId || !objectKey || objectKey.split("/").some((segment) => !segment || segment === "." || segment === "..") || !targetTier) {
-        throw new LifecycleValidationError(`Lifecycle item ${index + 1} is invalid.`);
-      }
-      let parsedSource;
-      try {
-        parsedSource = new URL(sourceUrl);
-      } catch {
-        throw new LifecycleValidationError(`Lifecycle item ${index + 1} sourceUrl is invalid.`);
-      }
-      if (parsedSource.protocol !== "http:" && parsedSource.protocol !== "https:") {
-        throw new LifecycleValidationError(`Lifecycle item ${index + 1} sourceUrl must use http or https.`);
-      }
-      const expectedSizeBytes = item.expectedSizeBytes == null ? null : Number(item.expectedSizeBytes);
-      if (expectedSizeBytes !== null && (!Number.isSafeInteger(expectedSizeBytes) || expectedSizeBytes < 0)) {
-        throw new LifecycleValidationError(`Lifecycle item ${index + 1} expectedSizeBytes is invalid.`);
-      }
-      return {
-        lifecycleObjectId,
-        objectKey,
-        sourceUrl: parsedSource.toString(),
-        targetTier,
-        expectedSizeBytes,
-        expectedSha256: typeof item.expectedSha256 === "string" && /^[a-f\d]{64}$/i.test(item.expectedSha256) ? item.expectedSha256.toLowerCase() : null,
-        mimeType: typeof item.mimeType === "string" && item.mimeType.trim() ? item.mimeType.trim().slice(0, 191) : null,
-      };
-    });
+    const normalizedItems = items.map((item, index) => normalizeLifecycleItem(item, index));
     const uniqueLifecycleIds = new Set(normalizedItems.map((item) => item.lifecycleObjectId));
     if (uniqueLifecycleIds.size !== normalizedItems.length) {
       throw new LifecycleValidationError("Lifecycle job contains duplicate lifecycleObjectId values.");
@@ -599,7 +882,7 @@ export class LifecycleStore {
     const row = this.db.prepare("SELECT * FROM transfer_jobs WHERE id = ?").get(id);
     if (!row) return null;
     const items = this.db.prepare("SELECT * FROM transfer_items WHERE job_id = ? ORDER BY created_at, id").all(id).map(serializeItem);
-    return serializeJob(row, items);
+    return { ...serializeJob(row, items), ...this.getCallbackDeliverySummary(id) };
   }
 
   getJobDiagnostics(id) {
@@ -642,9 +925,11 @@ export class LifecycleStore {
 
   listRunnableItems(limit = 100) {
     return this.db.prepare(`
-      SELECT * FROM transfer_items
-      WHERE status = 'QUEUED' OR (status = 'RETRY_WAIT' AND (next_retry_at IS NULL OR next_retry_at <= ?))
-      ORDER BY created_at, id
+      SELECT i.* FROM transfer_items i
+      JOIN transfer_jobs j ON j.id = i.job_id
+      WHERE j.manifest_status = 'SEALED'
+        AND (i.status = 'QUEUED' OR (i.status = 'RETRY_WAIT' AND (i.next_retry_at IS NULL OR i.next_retry_at <= ?)))
+      ORDER BY i.created_at, i.id
       LIMIT ?
     `).all(nowIso(), Math.max(1, Math.min(100, limit))).map(serializeItem);
   }
@@ -654,7 +939,8 @@ export class LifecycleStore {
     const result = this.db.prepare(`
       UPDATE transfer_items
       SET status = 'RUNNING', attempt_count = attempt_count + 1,
-          started_at = COALESCE(started_at, ?), next_retry_at = NULL, error = NULL, updated_at = ?
+          started_at = COALESCE(started_at, ?), next_retry_at = NULL, error = NULL,
+          failure_kind = NULL, failure_status_code = NULL, retryable = NULL, updated_at = ?
       WHERE id = ? AND status IN ('QUEUED', 'RETRY_WAIT')
     `).run(now, now, id);
     if (!result.changes) return null;
@@ -672,6 +958,7 @@ export class LifecycleStore {
       ["ossBucket", "oss_bucket"], ["ossSizeBytes", "oss_size_bytes"], ["ossEtag", "oss_etag"], ["ossDirectUrl", "oss_direct_url"],
       ["ossSelectedUrl", "oss_selected_url"], ["ossCdnVerified", "oss_cdn_verified"], ["ossVerifiedAt", "oss_verified_at"],
       ["checkpoint", "checkpoint_json"], ["warning", "warning"], ["error", "error"], ["finishedAt", "finished_at"],
+      ["failureKind", "failure_kind"], ["failureStatusCode", "failure_status_code"], ["retryable", "retryable"],
     ]);
     const assignments = [];
     const parameters = [];
@@ -682,7 +969,7 @@ export class LifecycleStore {
       parameters.push(
         key === "checkpoint"
           ? (value == null ? null : JSON.stringify(value))
-          : key === "ossCdnVerified" || key === "homeReused"
+          : key === "ossCdnVerified" || key === "homeReused" || key === "retryable"
             ? (value == null ? null : value ? 1 : 0)
             : value,
       );
@@ -700,10 +987,107 @@ export class LifecycleStore {
     return this.db.prepare("SELECT status FROM transfer_items WHERE id = ?").get(id)?.status === "CANCELLED";
   }
 
-  cancelJob(id, reason = "Cancelled by administrator") {
+  enqueueItemCallback(itemId) {
+    const itemRow = this.db.prepare("SELECT * FROM transfer_items WHERE id = ?").get(itemId);
+    if (!itemRow || !ITEM_TERMINAL_STATUSES.has(itemRow.status)) return null;
+    const job = this.getJobControl(itemRow.job_id);
+    if (!job?.callback_url || !job.callback_token) return null;
+    const existing = this.db.prepare("SELECT * FROM callback_outbox WHERE run_id = ? AND item_id = ?").get(itemRow.job_id, itemId);
+    if (existing) return serializeCallback(existing);
+    const now = nowIso();
+    let callbackId = "";
+    this.db.transaction(() => {
+      const sequence = Number(job.last_callback_sequence || 0) + 1;
+      callbackId = randomUUID();
+      this.db.prepare(`
+        INSERT INTO callback_outbox(
+          id, run_id, item_id, sequence, status, payload_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?)
+      `).run(callbackId, itemRow.job_id, itemId, sequence, JSON.stringify(serializeItem(itemRow)), now, now);
+      this.db.prepare("UPDATE transfer_jobs SET last_callback_sequence = ?, updated_at = ? WHERE id = ?")
+        .run(sequence, now, itemRow.job_id);
+    })();
+    return serializeCallback(this.db.prepare("SELECT * FROM callback_outbox WHERE id = ?").get(callbackId));
+  }
+
+  listRunnableCallbacks(limit = 100) {
+    return this.db.prepare(`
+      SELECT c.*, j.callback_url, j.callback_token
+      FROM callback_outbox c
+      JOIN transfer_jobs j ON j.id = c.run_id
+      WHERE c.status = 'QUEUED'
+         OR (c.status = 'RETRY_WAIT' AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?))
+      ORDER BY c.run_id, c.sequence
+      LIMIT ?
+    `).all(nowIso(), Math.max(1, Math.min(1000, limit))).map((row) => ({
+      ...serializeCallback(row),
+      callbackUrl: row.callback_url,
+      callbackToken: row.callback_token,
+    }));
+  }
+
+  claimCallbacks(ids) {
+    const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+    if (!uniqueIds.length) return [];
+    const now = nowIso();
+    const placeholders = uniqueIds.map(() => "?").join(",");
+    this.db.prepare(`
+      UPDATE callback_outbox
+      SET status = 'SENDING', attempt_count = attempt_count + 1, next_retry_at = NULL, error = NULL, updated_at = ?
+      WHERE id IN (${placeholders}) AND status IN ('QUEUED', 'RETRY_WAIT')
+    `).run(now, ...uniqueIds);
+    return this.db.prepare(`
+      SELECT c.*, j.callback_url, j.callback_token
+      FROM callback_outbox c JOIN transfer_jobs j ON j.id = c.run_id
+      WHERE c.id IN (${placeholders}) AND c.status = 'SENDING'
+      ORDER BY c.sequence
+    `).all(...uniqueIds).map((row) => ({
+      ...serializeCallback(row),
+      callbackUrl: row.callback_url,
+      callbackToken: row.callback_token,
+    }));
+  }
+
+  markCallbacksDelivered(ids) {
+    const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+    if (!uniqueIds.length) return;
+    const placeholders = uniqueIds.map(() => "?").join(",");
+    const now = nowIso();
+    this.db.prepare(`
+      UPDATE callback_outbox
+      SET status = 'DELIVERED', delivered_at = ?, next_retry_at = NULL, error = NULL, updated_at = ?
+      WHERE id IN (${placeholders})
+    `).run(now, now, ...uniqueIds);
+  }
+
+  markCallbacksRetry(ids, error) {
+    const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+    if (!uniqueIds.length) return;
+    const placeholders = uniqueIds.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT id, attempt_count FROM callback_outbox WHERE id IN (${placeholders})`).all(...uniqueIds);
+    const update = this.db.prepare(`
+      UPDATE callback_outbox SET status = ?, next_retry_at = ?, error = ?, updated_at = ? WHERE id = ?
+    `);
+    this.db.transaction(() => {
+      for (const row of rows) {
+        const exhausted = row.attempt_count >= 10;
+        const delayMs = Math.min(6 * 60 * 60 * 1000, 5_000 * 2 ** Math.max(0, row.attempt_count - 1));
+        update.run(
+          exhausted ? "FAILED" : "RETRY_WAIT",
+          exhausted ? null : new Date(Date.now() + delayMs).toISOString(),
+          String(error || "Callback failed").slice(0, 4000),
+          nowIso(),
+          row.id,
+        );
+      }
+    })();
+  }
+
+  cancelJob(id, reason = "Cancelled by administrator", summaryOnly = false) {
+    const readResult = () => summaryOnly ? this.getJobSummary(id) : this.getJob(id);
     const job = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(id);
     if (!job) return null;
-    if (job.status === "SUCCEEDED" || job.status === "FAILED") return this.getJob(id);
+    if (job.status === "SUCCEEDED" || job.status === "FAILED") return readResult();
     const now = nowIso();
     this.db.transaction(() => {
       this.db.prepare(`
@@ -714,11 +1098,51 @@ export class LifecycleStore {
       `).run(reason, now, now, id);
       this.db.prepare(`
         UPDATE transfer_jobs
-        SET status = 'CANCELLED', error = ?, finished_at = ?, updated_at = ?
+        SET status = 'CANCELLED',
+            manifest_status = CASE WHEN manifest_status = 'SEALED' THEN manifest_status ELSE 'CANCELLED' END,
+            error = ?, finished_at = ?, updated_at = ?
         WHERE id = ?
       `).run(reason, now, now, id);
     })();
-    return this.getJob(id);
+    return readResult();
+  }
+
+  resumeStreamingJob(id) {
+    const job = this.getJobControl(id);
+    if (!job) return null;
+    const callbackResetAt = nowIso();
+    this.db.prepare(`
+      UPDATE callback_outbox
+      SET status = 'QUEUED', next_retry_at = NULL, error = NULL, updated_at = ?
+      WHERE run_id = ? AND status = 'FAILED'
+    `).run(callbackResetAt, id);
+    if (job.manifest_status !== "SEALED") {
+      if (!["CANCELLED", "FAILED", "RETRY_WAIT"].includes(job.manifest_status)) return this.getJobSummary(id);
+      const now = nowIso();
+      this.db.transaction(() => {
+        this.db.prepare(`
+          UPDATE transfer_items
+          SET status = 'QUEUED', stage = CASE WHEN home_verified_at IS NULL THEN 'PENDING' ELSE 'HOME_VERIFIED' END,
+              next_retry_at = NULL, error = NULL, failure_kind = NULL, failure_status_code = NULL,
+              retryable = NULL, finished_at = NULL, updated_at = ?
+          WHERE job_id = ? AND status = 'CANCELLED'
+        `).run(now, id);
+        this.db.prepare(`
+          UPDATE transfer_jobs
+          SET status = 'INGESTING', manifest_status = 'PENDING', manifest_next_retry_at = NULL,
+              error = NULL, finished_at = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(now, id);
+        this.db.prepare(`
+          UPDATE callback_outbox
+          SET status = 'QUEUED', next_retry_at = NULL, error = NULL, updated_at = ?
+          WHERE run_id = ? AND status = 'FAILED'
+        `).run(now, id);
+      })();
+      return this.getJobSummary(id);
+    }
+    this.resumeJob(id);
+    return this.getJobSummary(id);
   }
 
   resumeJob(id) {
@@ -730,13 +1154,19 @@ export class LifecycleStore {
       this.db.prepare(`
         UPDATE transfer_items
         SET status = 'QUEUED', stage = CASE WHEN home_verified_at IS NULL THEN 'PENDING' ELSE 'HOME_VERIFIED' END,
-            next_retry_at = NULL, error = NULL, finished_at = NULL, updated_at = ?
+            next_retry_at = NULL, error = NULL, failure_kind = NULL, failure_status_code = NULL,
+            retryable = NULL, finished_at = NULL, updated_at = ?
         WHERE job_id = ? AND status = 'CANCELLED'
       `).run(now, id);
       this.db.prepare(`
         UPDATE transfer_jobs
         SET status = 'QUEUED', error = NULL, finished_at = NULL, updated_at = ?
         WHERE id = ?
+      `).run(now, id);
+      this.db.prepare(`
+        UPDATE callback_outbox
+        SET status = 'QUEUED', next_retry_at = NULL, error = NULL, updated_at = ?
+        WHERE run_id = ? AND status = 'FAILED'
       `).run(now, id);
     })();
     return this.getJob(id);
@@ -803,6 +1233,7 @@ export class LifecycleStore {
       .all(Math.max(1, Math.min(100, limit)))
       .map((row) => ({
         ...serializeJob(row),
+        ...this.getCallbackDeliverySummary(row.id),
         diagnostics: this.getJobDiagnostics(row.id),
       }));
   }
