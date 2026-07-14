@@ -18,6 +18,31 @@ import { LifecycleValidationError } from "./lifecycle-store.mjs";
 const MAX_ATTEMPTS = 10;
 const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 410]);
+
+export class PermanentLifecycleTransferError extends Error {
+  constructor(message, statusCode = null) {
+    super(message);
+    this.name = "PermanentLifecycleTransferError";
+    this.statusCode = statusCode;
+  }
+}
+
+export function isPermanentLifecycleTransferError(error) {
+  if (error instanceof PermanentLifecycleTransferError) return true;
+  const status = Number(error?.status ?? error?.statusCode ?? error?.$metadata?.httpStatusCode);
+  return Number.isInteger(status) && PERMANENT_HTTP_STATUSES.has(status);
+}
+
+function combinedSignal(signal, timeoutMs) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("Lifecycle transfer cancelled.");
+}
 
 function readInteger(value, fallback, { min, max }) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -178,6 +203,7 @@ export class LifecycleTransferService {
     this.httpSemaphore = new Semaphore(this.maxHttpConcurrency);
     this.activeItemIds = new Set();
     this.activeObjectKeys = new Set();
+    this.activeTransfers = new Map();
     this.byteSamples = [];
     this.timer = null;
     this.stopped = true;
@@ -281,6 +307,21 @@ export class LifecycleTransferService {
     return this.store.getJob(id);
   }
 
+  cancelJob(id) {
+    const job = this.store.cancelJob(id);
+    if (!job) return null;
+    for (const transfer of this.activeTransfers.values()) {
+      if (transfer.jobId === id) transfer.controller.abort(new Error("Lifecycle job cancelled."));
+    }
+    return this.store.getJob(id);
+  }
+
+  resumeJob(id) {
+    const job = this.store.resumeJob(id);
+    if (job && !this.stopped) void this.kick();
+    return job;
+  }
+
   async headHomeObject(objectKey) {
     return this.httpSemaphore.use(async () => {
       try {
@@ -298,7 +339,8 @@ export class LifecycleTransferService {
     });
   }
 
-  async copySourceToHome(item) {
+  async copySourceToHome(item, signal) {
+    throwIfAborted(signal);
     await this.ensureBucket();
     const existing = await this.headHomeObject(item.objectKey);
     if (existing) {
@@ -307,7 +349,7 @@ export class LifecycleTransferService {
       const hasVerificationEvidence = expectedHomeSize !== null || Boolean(expectedHomeSha256);
       const sizeMatches = expectedHomeSize === null || existing.sizeBytes === expectedHomeSize;
       const knownSha256 = expectedHomeSha256
-        ? existing.sha256 || await this.hashHomeObject(item.objectKey)
+        ? existing.sha256 || await this.hashHomeObject(item.objectKey, signal)
         : existing.sha256;
       const hashMatches = !expectedHomeSha256 || knownSha256 === expectedHomeSha256;
       if (hasVerificationEvidence && sizeMatches && hashMatches) {
@@ -315,23 +357,27 @@ export class LifecycleTransferService {
       }
     }
     if (!sourceUrlMatchesObjectKey(item.sourceUrl, item.objectKey)) {
-      throw new Error("Source URL path does not match objectKey.");
+      throw new PermanentLifecycleTransferError("Source URL path does not match objectKey.");
     }
 
     const copied = await this.pullSemaphore.use(() => this.httpSemaphore.use(async () => {
       const response = await this.fetch(item.sourceUrl, {
         redirect: "follow",
-        signal: AbortSignal.timeout(DEFAULT_REQUEST_TIMEOUT_MS),
+        signal: combinedSignal(signal, DEFAULT_REQUEST_TIMEOUT_MS),
       });
       if (!response.ok || !response.body) {
-        throw new Error(`Source download failed with HTTP ${response.status}.`);
+        const message = `Source download failed with HTTP ${response.status}.`;
+        if (PERMANENT_HTTP_STATUSES.has(response.status)) {
+          throw new PermanentLifecycleTransferError(message, response.status);
+        }
+        throw new Error(message);
       }
       const contentLength = Number(response.headers.get("content-length"));
       if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
-        throw new Error("Source response is missing a valid Content-Length.");
+        throw new PermanentLifecycleTransferError("Source response is missing a valid Content-Length.");
       }
       if (item.expectedSizeBytes != null && contentLength !== item.expectedSizeBytes) {
-        throw new Error(`Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`);
+        throw new PermanentLifecycleTransferError(`Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`);
       }
 
       const hash = createHash("sha256");
@@ -352,13 +398,13 @@ export class LifecycleTransferService {
         Body: body,
         ContentLength: contentLength,
         ContentType: item.mimeType || response.headers.get("content-type") || "application/octet-stream",
-      }));
+      }), { abortSignal: signal });
       if (copiedBytes !== contentLength) {
         throw new Error(`Home MinIO copy ended at ${copiedBytes} of ${contentLength} bytes.`);
       }
       const sha256 = hash.digest("hex");
       if (item.expectedSha256 && sha256 !== item.expectedSha256) {
-        throw new Error("Source SHA-256 does not match the expected checksum.");
+        throw new PermanentLifecycleTransferError("Source SHA-256 does not match the expected checksum.");
       }
       return { contentLength, uploadEtag: normalizeEtag(upload.ETag), sha256 };
     }, 2));
@@ -369,11 +415,18 @@ export class LifecycleTransferService {
     return { ...verified, etag: verified.etag || copied.uploadEtag, sha256: copied.sha256 };
   }
 
-  async hashHomeObject(objectKey) {
+  async hashHomeObject(objectKey, signal) {
     return this.httpSemaphore.use(async () => {
-      const response = await this.minioClient.send(new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+      throwIfAborted(signal);
+      const response = await this.minioClient.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
+        { abortSignal: signal },
+      );
       const hash = createHash("sha256");
-      for await (const chunk of nodeReadable(response.Body)) hash.update(chunk);
+      for await (const chunk of nodeReadable(response.Body)) {
+        throwIfAborted(signal);
+        hash.update(chunk);
+      }
       return hash.digest("hex");
     });
   }
@@ -388,7 +441,8 @@ export class LifecycleTransferService {
     }));
   }
 
-  async stageHomeObject(item, expectedSize, expectedSha256) {
+  async stageHomeObject(item, expectedSize, expectedSha256, signal) {
+    throwIfAborted(signal);
     const digest = createHash("sha256").update(`${item.id}\n${item.objectKey}`).digest("hex");
     const filePath = resolve(this.workDir, digest.slice(0, 2), digest);
     await mkdir(dirname(filePath), { recursive: true });
@@ -400,7 +454,10 @@ export class LifecycleTransferService {
     }
 
     return this.httpSemaphore.use(async () => {
-      const response = await this.minioClient.send(new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }));
+      const response = await this.minioClient.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }),
+        { abortSignal: signal },
+      );
       const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
       const hash = createHash("sha256");
       let copiedBytes = 0;
@@ -412,7 +469,7 @@ export class LifecycleTransferService {
         },
       });
       try {
-        await pipeline(nodeReadable(response.Body), counter, createWriteStream(tempPath, { flags: "wx" }));
+        await pipeline(nodeReadable(response.Body), counter, createWriteStream(tempPath, { flags: "wx" }), { signal });
         if (copiedBytes !== expectedSize) throw new Error(`Staged object size mismatch: ${copiedBytes} of ${expectedSize}.`);
         const sha256 = hash.digest("hex");
         if (expectedSha256 && sha256 !== expectedSha256) throw new Error("Staged object SHA-256 mismatch.");
@@ -427,9 +484,10 @@ export class LifecycleTransferService {
     });
   }
 
-  async headOssObject(client, objectKey) {
+  async headOssObject(client, objectKey, signal) {
     return this.httpSemaphore.use(async () => {
       try {
+        throwIfAborted(signal);
         const result = await client.head(objectKey);
         return {
           sizeBytes: Number(result.res?.headers?.["content-length"] ?? result.meta?.["content-length"] ?? 0),
@@ -443,12 +501,13 @@ export class LifecycleTransferService {
     });
   }
 
-  async validatePublicUrl(url, expectedSize) {
+  async validatePublicUrl(url, expectedSize, signal) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      throwIfAborted(signal);
       const head = await this.httpSemaphore.use(() => this.fetch(url, {
         method: "HEAD",
         redirect: "follow",
-        signal: AbortSignal.timeout(10_000),
+        signal: combinedSignal(signal, 10_000),
       }).catch(() => null));
       if (head?.ok) {
         const rawSize = head.headers.get("content-length");
@@ -459,7 +518,7 @@ export class LifecycleTransferService {
         method: "GET",
         headers: { Range: "bytes=0-0" },
         redirect: "follow",
-        signal: AbortSignal.timeout(10_000),
+        signal: combinedSignal(signal, 10_000),
       }).catch(() => null));
       if (range) {
         const contentRange = range.headers.get("content-range") || "";
@@ -471,85 +530,107 @@ export class LifecycleTransferService {
         await range.body?.cancel?.().catch?.(() => undefined);
         if (validPartial || validFull) return true;
       }
+      throwIfAborted(signal);
       if (attempt < 2) await delay(1000 * (attempt + 1));
     }
     return false;
   }
 
-  async uploadHomeObjectToOss(item, home) {
+  async uploadHomeObjectToOss(item, home, signal) {
+    throwIfAborted(signal);
     const job = this.store.getJob(item.jobId);
     const config = this.store.getDecryptedConfig(job.configVersionId);
     const client = this.ossClientFactory(config);
-    const existing = await this.headOssObject(client, item.objectKey);
-    let etag = existing?.etag || null;
-    let sha256 = home.sha256 || item.expectedSha256 || null;
-
-    if (!existing || existing.sizeBytes !== home.sizeBytes || (sha256 && existing.sha256 !== sha256)) {
-      await this.ossSemaphore.use(async () => {
-        if (home.sizeBytes >= this.multipartThresholdBytes) {
-          const staged = await this.stageHomeObject(item, home.sizeBytes, sha256);
-          sha256 = staged.sha256;
-          const checkpoint = this.store.getCheckpoint(item.id);
-          let lastMultipartBytes = 0;
-          const result = await this.httpSemaphore.use(() => client.multipartUpload(item.objectKey, staged.filePath, {
-            parallel: this.multipartConcurrency,
-            partSize: this.partSizeBytes,
-            checkpoint: checkpoint && checkpoint.name === item.objectKey ? { ...checkpoint, file: staged.filePath } : undefined,
-            mime: item.mimeType || "application/octet-stream",
-            meta: sha256 ? { sha256 } : undefined,
-            progress: async (percentage, nextCheckpoint) => {
-              const uploadedBytes = Math.max(0, Math.min(home.sizeBytes, Math.round(Number(percentage || 0) * home.sizeBytes)));
-              this.recordTransferredBytes(Math.max(0, uploadedBytes - lastMultipartBytes));
-              lastMultipartBytes = Math.max(lastMultipartBytes, uploadedBytes);
-              if (!nextCheckpoint) return;
-              const serializable = { ...nextCheckpoint, file: staged.filePath };
-              this.store.updateItem(item.id, { checkpoint: serializable, stage: "OSS_UPLOADING" });
-              this.store.replaceMultipartParts(item.id, nextCheckpoint.doneParts, nextCheckpoint.partSize);
-            },
-          }), this.multipartConcurrency);
-          etag = normalizeEtag(result.etag || result.res?.headers?.etag);
-          await rm(staged.filePath, { force: true }).catch(() => undefined);
-        } else {
-          const result = await this.httpSemaphore.use(async () => {
-            const response = await this.minioClient.send(new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }));
-            return client.putStream(item.objectKey, this.meteredReadable(response.Body), {
-              contentLength: home.sizeBytes,
-              mime: item.mimeType || response.ContentType || "application/octet-stream",
-              meta: sha256 ? { sha256 } : undefined,
-            });
-          }, 2);
-          etag = normalizeEtag(result.res?.headers?.etag);
-        }
-      });
-    }
-
-    const verified = await this.headOssObject(client, item.objectKey);
-    if (!verified || verified.sizeBytes !== home.sizeBytes || (sha256 && verified.sha256 !== sha256)) {
-      throw new Error("OSS HEAD verification failed after upload.");
-    }
-    const directUrl = buildDirectOssUrl(config, item.objectKey);
-    const directVerified = await this.validatePublicUrl(directUrl, home.sizeBytes);
-    if (!directVerified) throw new Error("Direct OSS public URL verification failed.");
-
-    let selectedUrl = directUrl;
-    let cdnVerified = false;
-    let warning = null;
-    if (config.publicBaseUrl) {
-      const cdnUrl = `${config.publicBaseUrl.replace(/\/+$/, "")}/${encodeObjectKey(item.objectKey)}`;
-      cdnVerified = await this.validatePublicUrl(cdnUrl, home.sizeBytes);
-      if (cdnVerified) selectedUrl = cdnUrl;
-      else warning = "Configured CDN URL was unavailable; direct OSS URL was selected.";
-    }
-
-    return {
-      bucket: config.bucket,
-      sizeBytes: verified.sizeBytes,
-      etag: verified.etag || etag,
-      directUrl,
-      selectedUrl,
-      cdnVerified,
-      warning,
+    const cancelClient = () => {
+      try {
+        client.cancel?.();
+      } catch {
+        // The persisted CANCELLED state remains authoritative even if the client has no active request.
+      }
     };
+    signal?.addEventListener("abort", cancelClient, { once: true });
+    try {
+      const existing = await this.headOssObject(client, item.objectKey, signal);
+      let etag = existing?.etag || null;
+      let sha256 = home.sha256 || item.expectedSha256 || null;
+
+      if (!existing || existing.sizeBytes !== home.sizeBytes || (sha256 && existing.sha256 !== sha256)) {
+        await this.ossSemaphore.use(async () => {
+          throwIfAborted(signal);
+          if (home.sizeBytes >= this.multipartThresholdBytes) {
+            const staged = await this.stageHomeObject(item, home.sizeBytes, sha256, signal);
+            sha256 = staged.sha256;
+            const checkpoint = this.store.getCheckpoint(item.id);
+            let lastMultipartBytes = 0;
+            const result = await this.httpSemaphore.use(() => client.multipartUpload(item.objectKey, staged.filePath, {
+              parallel: this.multipartConcurrency,
+              partSize: this.partSizeBytes,
+              checkpoint: checkpoint && checkpoint.name === item.objectKey ? { ...checkpoint, file: staged.filePath } : undefined,
+              mime: item.mimeType || "application/octet-stream",
+              meta: sha256 ? { sha256 } : undefined,
+              progress: async (percentage, nextCheckpoint) => {
+                throwIfAborted(signal);
+                const uploadedBytes = Math.max(0, Math.min(home.sizeBytes, Math.round(Number(percentage || 0) * home.sizeBytes)));
+                this.recordTransferredBytes(Math.max(0, uploadedBytes - lastMultipartBytes));
+                lastMultipartBytes = Math.max(lastMultipartBytes, uploadedBytes);
+                if (!nextCheckpoint) return;
+                const serializable = { ...nextCheckpoint, file: staged.filePath };
+                this.store.updateItem(item.id, { checkpoint: serializable, stage: "OSS_UPLOADING" });
+                this.store.replaceMultipartParts(item.id, nextCheckpoint.doneParts, nextCheckpoint.partSize);
+              },
+            }), this.multipartConcurrency);
+            throwIfAborted(signal);
+            etag = normalizeEtag(result.etag || result.res?.headers?.etag);
+            await rm(staged.filePath, { force: true }).catch(() => undefined);
+          } else {
+            const result = await this.httpSemaphore.use(async () => {
+              throwIfAborted(signal);
+              const response = await this.minioClient.send(
+                new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }),
+                { abortSignal: signal },
+              );
+              return client.putStream(item.objectKey, this.meteredReadable(response.Body), {
+                contentLength: home.sizeBytes,
+                mime: item.mimeType || response.ContentType || "application/octet-stream",
+                meta: sha256 ? { sha256 } : undefined,
+              });
+            }, 2);
+            throwIfAborted(signal);
+            etag = normalizeEtag(result.res?.headers?.etag);
+          }
+        });
+      }
+
+      const verified = await this.headOssObject(client, item.objectKey, signal);
+      if (!verified || verified.sizeBytes !== home.sizeBytes || (sha256 && verified.sha256 !== sha256)) {
+        throw new Error("OSS HEAD verification failed after upload.");
+      }
+      const directUrl = buildDirectOssUrl(config, item.objectKey);
+      const directVerified = await this.validatePublicUrl(directUrl, home.sizeBytes, signal);
+      if (!directVerified) throw new Error("Direct OSS public URL verification failed.");
+
+      let selectedUrl = directUrl;
+      let cdnVerified = false;
+      let warning = null;
+      if (config.publicBaseUrl) {
+        const cdnUrl = `${config.publicBaseUrl.replace(/\/+$/, "")}/${encodeObjectKey(item.objectKey)}`;
+        cdnVerified = await this.validatePublicUrl(cdnUrl, home.sizeBytes, signal);
+        if (cdnVerified) selectedUrl = cdnUrl;
+        else warning = "Configured CDN URL was unavailable; direct OSS URL was selected.";
+      }
+
+      return {
+        bucket: config.bucket,
+        sizeBytes: verified.sizeBytes,
+        etag: verified.etag || etag,
+        directUrl,
+        selectedUrl,
+        cdnVerified,
+        warning,
+      };
+    } finally {
+      signal?.removeEventListener("abort", cancelClient);
+    }
   }
 
   retryAt(attemptCount) {
@@ -560,9 +641,12 @@ export class LifecycleTransferService {
   async processItem(itemId) {
     const item = this.store.claimItem(itemId);
     if (!item) return;
+    const controller = new AbortController();
+    this.activeTransfers.set(item.id, { jobId: item.jobId, controller });
     try {
       this.store.updateItem(item.id, { stage: "HOME_COPYING" });
-      const home = await this.copySourceToHome(item);
+      const home = await this.copySourceToHome(item, controller.signal);
+      if (controller.signal.aborted || this.store.isItemCancelled(item.id)) return;
       const verifiedAt = new Date().toISOString();
       this.store.updateItem(item.id, {
         stage: "HOME_VERIFIED",
@@ -582,8 +666,10 @@ export class LifecycleTransferService {
         return;
       }
 
+      if (controller.signal.aborted || this.store.isItemCancelled(item.id)) return;
       this.store.updateItem(item.id, { stage: "OSS_UPLOADING" });
-      const oss = await this.uploadHomeObjectToOss(item, home);
+      const oss = await this.uploadHomeObjectToOss(item, home, controller.signal);
+      if (controller.signal.aborted || this.store.isItemCancelled(item.id)) return;
       this.store.updateItem(item.id, {
         status: "SUCCEEDED",
         stage: "COMPLETED",
@@ -599,6 +685,7 @@ export class LifecycleTransferService {
         finishedAt: new Date().toISOString(),
       });
     } catch (error) {
+      if (controller.signal.aborted || this.store.isItemCancelled(item.id)) return;
       let ossConfig = null;
       try {
         const job = this.store.getJob(item.jobId);
@@ -618,15 +705,20 @@ export class LifecycleTransferService {
           ossConfig?.accessKeySecret,
         ],
       );
-      const failed = item.attemptCount >= MAX_ATTEMPTS;
+      const permanent = isPermanentLifecycleTransferError(error);
+      const failed = permanent || item.attemptCount >= MAX_ATTEMPTS;
+      const nextRetryAt = failed ? null : this.retryAt(item.attemptCount);
       this.store.updateItem(item.id, {
         status: failed ? "FAILED" : "RETRY_WAIT",
         stage: failed ? "FAILED" : "RETRY_WAIT",
-        nextRetryAt: failed ? null : this.retryAt(item.attemptCount),
+        nextRetryAt,
         error: message.slice(0, 4000),
         finishedAt: failed ? new Date().toISOString() : null,
       });
-      if (failed) console.error(`[home-minio] lifecycle item ${item.id} exhausted retries: ${message}`);
+      const level = failed ? "error" : "warn";
+      console[level](`[home-minio] lifecycle item ${item.id} ${failed ? "failed" : `retry at ${nextRetryAt}`}: ${message}`);
+    } finally {
+      this.activeTransfers.delete(item.id);
     }
   }
 }

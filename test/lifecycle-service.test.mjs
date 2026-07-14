@@ -103,6 +103,7 @@ async function setupService({
   body,
   threshold = 64 * 1024 * 1024,
   fetchDelayMs = 0,
+  sourceStatus = 200,
   failFirstMultipart = false,
   cdnUnavailable = false,
   maxHttpConcurrency = 16,
@@ -118,7 +119,18 @@ async function setupService({
   const fetchImpl = async (url, options = {}) => {
     if (String(url).startsWith("https://source.example.test/")) {
       stats.sourceFetchCount += 1;
-      if (fetchDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, fetchDelayMs));
+      if (fetchDelayMs > 0) {
+        await new Promise((resolveDelay, rejectDelay) => {
+          const timer = setTimeout(resolveDelay, fetchDelayMs);
+          const abort = () => {
+            clearTimeout(timer);
+            rejectDelay(options.signal?.reason instanceof Error ? options.signal.reason : new Error("aborted"));
+          };
+          if (options.signal?.aborted) abort();
+          else options.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (sourceStatus !== 200) return new Response(null, { status: sourceStatus });
       return new Response(body, { headers: { "content-length": String(body.length), "content-type": "image/png" } });
     }
     if (cdnUnavailable && String(url).startsWith("https://cdn.example.test/")) {
@@ -169,6 +181,102 @@ test("lifecycle error messages redact exact credentials and credential-shaped fi
   assert.equal(message.includes("oss-super-secret"), false);
   assert.equal(message.includes("home-token"), false);
   assert.equal(message.includes("BearerToken"), false);
+});
+
+test("permanent source HTTP errors fail immediately instead of blocking a batch in retry wait", async () => {
+  const body = Buffer.from("missing-source");
+  const context = await setupService({ body, sourceStatus: 404 });
+  try {
+    const objectKey = "gateway-media/missing.png";
+    const job = context.store.createJob({
+      id: "missing-source-run",
+      mediaKind: "GENERATED_MEDIA",
+      items: [{
+        lifecycleObjectId: "media-missing-source",
+        objectKey,
+        sourceUrl: `https://source.example.test/local-media/${objectKey}`,
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: body.length,
+        mimeType: "image/png",
+      }],
+    });
+
+    await context.service.processItem(job.items[0].id);
+    const failed = context.store.getJob(job.id);
+    assert.equal(failed.status, "FAILED");
+    assert.equal(failed.items[0].status, "FAILED");
+    assert.equal(failed.items[0].attemptCount, 1);
+    assert.equal(failed.items[0].nextRetryAt, null);
+    assert.match(failed.items[0].error, /HTTP 404/);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test("cancelling a running lifecycle job aborts its active source transfer", async () => {
+  const body = Buffer.from("cancel-active-source");
+  const context = await setupService({ body, fetchDelayMs: 2_000 });
+  try {
+    const objectKey = "gateway-media/cancel-active.png";
+    const job = context.store.createJob({
+      id: "cancel-active-run",
+      mediaKind: "GENERATED_MEDIA",
+      items: [{
+        lifecycleObjectId: "media-cancel-active",
+        objectKey,
+        sourceUrl: `https://source.example.test/local-media/${objectKey}`,
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: body.length,
+        mimeType: "image/png",
+      }],
+    });
+
+    const processing = context.service.processItem(job.items[0].id);
+    while (context.stats.sourceFetchCount === 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    const cancelledAt = Date.now();
+    const cancelled = context.service.cancelJob(job.id);
+    await processing;
+
+    assert.equal(cancelled.status, "CANCELLED");
+    assert.equal(context.store.getJob(job.id).items[0].status, "CANCELLED");
+    assert.ok(Date.now() - cancelledAt < 500, "active source transfer did not abort promptly");
+    assert.equal(context.minio.objects.has(objectKey), false);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test("resuming immediately after cancellation cannot let the aborted worker overwrite the queued checkpoint", async () => {
+  const body = Buffer.from("cancel-resume-race");
+  const context = await setupService({ body, fetchDelayMs: 2_000 });
+  try {
+    const objectKey = "gateway-media/cancel-resume-race.png";
+    const job = context.store.createJob({
+      id: "cancel-resume-race-run",
+      mediaKind: "GENERATED_MEDIA",
+      items: [{
+        lifecycleObjectId: "media-cancel-resume-race",
+        objectKey,
+        sourceUrl: `https://source.example.test/local-media/${objectKey}`,
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: body.length,
+        mimeType: "image/png",
+      }],
+    });
+
+    const processing = context.service.processItem(job.items[0].id);
+    while (context.stats.sourceFetchCount === 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    context.service.cancelJob(job.id);
+    context.service.resumeJob(job.id);
+    await processing;
+
+    const resumed = context.store.getJob(job.id);
+    assert.equal(resumed.status, "QUEUED");
+    assert.equal(resumed.items[0].status, "QUEUED");
+    assert.equal(resumed.items[0].stage, "PENDING");
+  } finally {
+    await cleanup(context);
+  }
 });
 
 test("an existing same-size Home object is overwritten when its SHA-256 is wrong", async () => {

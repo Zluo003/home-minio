@@ -155,28 +155,84 @@ async function saveConfigPage(pageId, form) {
   }
 }
 
-function transferStatusText(status) {
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toFixed(unit === 0 ? 0 : 2)} ${units[unit]}`;
+}
+
+function formatTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function transferStatusMarkup(status) {
   const lifecycleSettings = status.lifecycle?.settings || {};
   const lifecycleTelemetry = status.lifecycle?.telemetry || {};
   const recentJobs = Array.isArray(status.lifecycle?.recentJobs) ? status.lifecycle.recentJobs : [];
-  return [
-    `状态：${status.lifecycle?.ready ? "ready" : "unavailable"}`,
-    `凭据保存：${status.lifecycle?.credentialStorage === "LOCAL_SQLITE" ? "本机 SQLite" : "-"}`,
-    `NewWaule 拉取并发：${lifecycleSettings.pullConcurrency ?? "-"}`,
-    `OSS 文件并发：${lifecycleSettings.ossFileConcurrency ?? "-"}`,
-    `Multipart 并发：${lifecycleSettings.multipartConcurrency ?? "-"}`,
-    `全局 HTTP 并发：${lifecycleSettings.maxHttpConcurrency ?? "-"}`,
-    `Multipart 阈值：${lifecycleSettings.multipartThresholdBytes ?? "-"}`,
-    `分片大小：${lifecycleSettings.partSizeBytes ?? "-"}`,
-    `当前活跃对象：${lifecycleTelemetry.activeObjects ?? 0}`,
-    `当前 HTTP 占用：${lifecycleTelemetry.activeHttpRequests ?? 0}/${lifecycleSettings.maxHttpConcurrency ?? "-"}`,
-    `60 秒吞吐：${Math.round(lifecycleTelemetry.throughputBytesPerSecond ?? 0)} bytes/s`,
-    "",
-    "最近任务：",
-    ...(recentJobs.length
-      ? recentJobs.map((job) => `${job.id} · ${job.mediaKind} · ${job.status} · ${job.succeededCount}/${job.totalCount} · ${job.processedBytes} bytes`)
-      : ["暂无任务"]),
-  ].join("\n");
+  const summary = `
+    <div class="transfer-summary">
+      <span>状态 <strong>${status.lifecycle?.ready ? "ready" : "unavailable"}</strong></span>
+      <span>活跃对象 <strong>${Number(lifecycleTelemetry.activeObjects || 0)}</strong></span>
+      <span>HTTP <strong>${Number(lifecycleTelemetry.activeHttpRequests || 0)}/${escapeHtml(lifecycleSettings.maxHttpConcurrency ?? "-")}</strong></span>
+      <span>实时吞吐 <strong>${escapeHtml(formatBytes(lifecycleTelemetry.throughputBytesPerSecond))}/s</strong></span>
+      <span>拉取并发 <strong>${escapeHtml(lifecycleSettings.pullConcurrency ?? "-")}</strong></span>
+      <span>OSS 并发 <strong>${escapeHtml(lifecycleSettings.ossFileConcurrency ?? "-")}</strong></span>
+    </div>
+  `;
+  if (!recentJobs.length) return `${summary}<p class="transfer-empty">暂无生命周期任务。</p>`;
+  const jobs = recentJobs.map((job) => {
+    const diagnostics = job.diagnostics || {};
+    const counts = diagnostics.statusCounts || {};
+    const processed = Number(job.processedCount || 0);
+    const total = Math.max(0, Number(job.totalCount || 0));
+    const percent = total > 0 ? Math.min(100, Math.max(0, Math.round(processed / total * 100))) : 0;
+    const canCancel = job.status === "QUEUED" || job.status === "RUNNING";
+    const canResume = job.status === "CANCELLED";
+    const errors = Array.isArray(diagnostics.errorSamples) ? diagnostics.errorSamples : [];
+    const errorMarkup = errors.length
+      ? `<ul class="transfer-errors">${errors.map((entry) => `<li><strong>${Number(entry.count || 0)} 个</strong>${escapeHtml(entry.message || "未知错误")}</li>`).join("")}</ul>`
+      : "";
+    return `
+      <article class="transfer-job transfer-job--${escapeHtml(String(job.status || "unknown").toLowerCase())}">
+        <header>
+          <div>
+            <strong>${escapeHtml(job.mediaKind)} · ${escapeHtml(job.status)}</strong>
+            <small>${escapeHtml(job.id)}</small>
+          </div>
+          ${canCancel ? `<button class="button-danger" data-job-action="cancel" data-job-id="${escapeHtml(job.id)}" type="button">中止</button>` : ""}
+          ${canResume ? `<button class="button-primary" data-job-action="resume" data-job-id="${escapeHtml(job.id)}" type="button">继续</button>` : ""}
+        </header>
+        <div class="transfer-progress-head"><span>${processed}/${total} 个文件</span><strong>${percent}%</strong></div>
+        <div class="transfer-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>
+        <div class="transfer-job-meta">
+          <span>成功 ${Number(job.succeededCount || 0)}</span>
+          <span>运行 ${Number(counts.RUNNING || 0)}</span>
+          <span>排队 ${Number(counts.QUEUED || 0)}</span>
+          <span>重试等待 ${Number(counts.RETRY_WAIT || 0)}</span>
+          <span>失败 ${Number(job.failedCount || 0)}</span>
+          <span>已处理 ${escapeHtml(formatBytes(job.processedBytes))}</span>
+          <span>下次重试 ${escapeHtml(formatTime(diagnostics.nextRetryAt))}</span>
+        </div>
+        ${errorMarkup}
+      </article>
+    `;
+  }).join("");
+  return `${summary}<div class="transfer-jobs">${jobs}</div>`;
+}
+
+function renderTransferStatus(status) {
+  const markup = transferStatusMarkup(status);
+  document.getElementById("transferStatus").innerHTML = markup;
+  document.getElementById("overviewTransferStatus").innerHTML = markup;
 }
 
 async function loadStatus() {
@@ -192,9 +248,7 @@ async function loadStatus() {
     ? `${status.lifecycle.activeItems} 处理中 · ${status.lifecycle.jobs} 批次`
     : status.lifecycle?.startupError || "未就绪";
 
-  const transferText = transferStatusText(status);
-  document.getElementById("transferStatus").textContent = transferText;
-  document.getElementById("overviewTransferStatus").textContent = transferText;
+  renderTransferStatus(status);
 
   const configText = Object.entries(status.newWauleConfig)
     .map(([key, value]) => `${key}: ${value}`)
@@ -204,6 +258,25 @@ async function loadStatus() {
     "",
     configText,
   ].join("\n");
+}
+
+async function runLifecycleJobAction(jobId, action) {
+  await api(`/api/lifecycle/jobs/${encodeURIComponent(jobId)}/${action}`, { method: "POST", body: "{}" });
+  showMessage(action === "cancel" ? "生命周期任务已中止。" : "生命周期任务已继续。", "ok");
+  await loadStatus();
+}
+
+for (const targetId of ["transferStatus", "overviewTransferStatus"]) {
+  document.getElementById(targetId).addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-job-action][data-job-id]");
+    if (!button) return;
+    button.disabled = true;
+    runLifecycleJobAction(button.dataset.jobId, button.dataset.jobAction)
+      .catch((error) => showMessage(error instanceof Error ? error.message : String(error), "error"))
+      .finally(() => {
+        if (button.isConnected) button.disabled = false;
+      });
+  });
 }
 
 async function runAction(path) {
@@ -268,3 +341,13 @@ document.getElementById("copyConfigButton").addEventListener("click", async () =
 
 setPage(location.hash.slice(1));
 await Promise.all([loadConfig(), loadStatus()]);
+let statusRefreshRunning = false;
+setInterval(() => {
+  if (document.hidden || statusRefreshRunning) return;
+  statusRefreshRunning = true;
+  loadStatus()
+    .catch((error) => showMessage(error instanceof Error ? error.message : String(error), "error"))
+    .finally(() => {
+      statusRefreshRunning = false;
+    });
+}, 3_000);

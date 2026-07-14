@@ -620,6 +620,18 @@ async function handle(request, reply) {
     return send(reply, job.status === "QUEUED" ? 202 : 200, { job, jobId: job.id });
   }
 
+  const lifecycleActionMatch = /^\/api\/lifecycle\/jobs\/([^/]+)\/(cancel|resume)$/.exec(url.pathname);
+  if (request.method === "POST" && lifecycleActionMatch) {
+    assertLifecycleReady();
+    const jobId = decodeURIComponent(lifecycleActionMatch[1]);
+    const action = lifecycleActionMatch[2];
+    const job = action === "cancel"
+      ? lifecycleService.cancelJob(jobId)
+      : lifecycleService.resumeJob(jobId);
+    if (!job) return send(reply, 404, { message: "lifecycle job not found" });
+    return send(reply, 200, { job, jobId: job.id });
+  }
+
   if (request.method === "GET" && url.pathname.startsWith("/api/lifecycle/jobs/")) {
     assertLifecycleReady();
     const jobId = decodeURIComponent(url.pathname.slice("/api/lifecycle/jobs/".length));

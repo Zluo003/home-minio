@@ -338,6 +338,134 @@ button:disabled {
   min-height: 140px;
 }
 
+.transfer-status {
+  min-height: 140px;
+  background: #070a0e;
+  color: #c8d4e2;
+  padding: 14px;
+}
+
+.transfer-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.transfer-summary span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 9px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.transfer-summary strong {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.transfer-jobs {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.transfer-job {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  padding: 12px;
+}
+
+.transfer-job > header,
+.transfer-progress-head,
+.transfer-job-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.transfer-job > header > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.transfer-job > header small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-progress-head {
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.transfer-progress {
+  height: 7px;
+  margin-top: 6px;
+  overflow: hidden;
+  border: 1px solid #294238;
+  background: #0a1210;
+}
+
+.transfer-progress i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.transfer-job-meta {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.transfer-job-meta span {
+  border-right: 1px solid var(--line);
+  padding-right: 10px;
+}
+
+.transfer-errors {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0 0;
+  padding: 9px 10px 9px 28px;
+  border: 1px solid #71363c;
+  background: #251216;
+  color: #ffb3b3;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.transfer-errors strong {
+  margin-right: 6px;
+}
+
+.transfer-empty {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.button-danger {
+  border-color: #863f45;
+  background: #521f25;
+}
+
 .toast {
   position: fixed;
   right: 24px;
@@ -388,7 +516,8 @@ button:disabled {
   }
 
   .status-grid,
-  .config-grid {
+  .config-grid,
+  .transfer-summary {
     grid-template-columns: 1fr;
   }
 

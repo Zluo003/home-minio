@@ -134,6 +134,49 @@ test("lifecycle jobs are idempotent and reject job id reuse with different data"
   });
 });
 
+test("cancelled lifecycle jobs retain completed items and resume unfinished items", async () => {
+  await withStore(({ store }) => {
+    const job = store.createJob({
+      id: "run-cancel-resume",
+      mediaKind: "WORKFLOW_UPLOAD",
+      items: [
+        {
+          lifecycleObjectId: "object-complete",
+          objectKey: "2026/07/complete.png",
+          sourceUrl: "https://api.example.test/local-media/2026/07/complete.png",
+          targetTier: "COLD_HOME_MINIO",
+          expectedSizeBytes: 12,
+        },
+        {
+          lifecycleObjectId: "object-pending",
+          objectKey: "2026/07/pending.png",
+          sourceUrl: "https://api.example.test/local-media/2026/07/pending.png",
+          targetTier: "COLD_HOME_MINIO",
+          expectedSizeBytes: 18,
+        },
+      ],
+    });
+    store.updateItem(job.items[0].id, {
+      status: "SUCCEEDED",
+      stage: "COMPLETED",
+      homeSizeBytes: 12,
+      homeVerifiedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    });
+
+    const cancelled = store.cancelJob(job.id);
+    assert.equal(cancelled.status, "CANCELLED");
+    assert.deepEqual(cancelled.items.map((item) => item.status), ["SUCCEEDED", "CANCELLED"]);
+    assert.equal(store.isJobTerminal(job.id), true);
+    assert.deepEqual(store.getJobDiagnostics(job.id).statusCounts, { CANCELLED: 1, SUCCEEDED: 1 });
+
+    const resumed = store.resumeJob(job.id);
+    assert.equal(resumed.status, "QUEUED");
+    assert.deepEqual(resumed.items.map((item) => item.status), ["SUCCEEDED", "QUEUED"]);
+    assert.equal(store.listRunnableItems().length, 1);
+  });
+});
+
 test("RUNNING jobs and items recover to retryable state after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "home-minio-recovery-"));
   const dbPath = join(root, "state.sqlite");

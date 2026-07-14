@@ -4,8 +4,8 @@ import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
 const SCHEMA_VERSION = 1;
-const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED"]);
-const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED"]);
+const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
+const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
 export class LifecycleConflictError extends Error {
   constructor(message) {
@@ -596,6 +596,40 @@ export class LifecycleStore {
     return serializeJob(row, items);
   }
 
+  getJobDiagnostics(id) {
+    const statusRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM transfer_items
+      WHERE job_id = ?
+      GROUP BY status
+    `).all(id);
+    const stageRows = this.db.prepare(`
+      SELECT stage, COUNT(*) AS count
+      FROM transfer_items
+      WHERE job_id = ?
+      GROUP BY stage
+    `).all(id);
+    const retry = this.db.prepare(`
+      SELECT MIN(next_retry_at) AS next_retry_at
+      FROM transfer_items
+      WHERE job_id = ? AND status = 'RETRY_WAIT' AND next_retry_at IS NOT NULL
+    `).get(id);
+    const errorRows = this.db.prepare(`
+      SELECT error, COUNT(*) AS count
+      FROM transfer_items
+      WHERE job_id = ? AND error IS NOT NULL AND error != ''
+      GROUP BY error
+      ORDER BY count DESC, error
+      LIMIT 5
+    `).all(id);
+    return {
+      statusCounts: Object.fromEntries(statusRows.map((row) => [row.status, row.count])),
+      stageCounts: Object.fromEntries(stageRows.map((row) => [row.stage, row.count])),
+      nextRetryAt: retry?.next_retry_at || null,
+      errorSamples: errorRows.map((row) => ({ message: row.error, count: row.count })),
+    };
+  }
+
   getItem(id) {
     return serializeItem(this.db.prepare("SELECT * FROM transfer_items WHERE id = ?").get(id));
   }
@@ -650,6 +684,52 @@ export class LifecycleStore {
     return item;
   }
 
+  isItemCancelled(id) {
+    return this.db.prepare("SELECT status FROM transfer_items WHERE id = ?").get(id)?.status === "CANCELLED";
+  }
+
+  cancelJob(id, reason = "Cancelled by administrator") {
+    const job = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(id);
+    if (!job) return null;
+    if (job.status === "SUCCEEDED" || job.status === "FAILED") return this.getJob(id);
+    const now = nowIso();
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE transfer_items
+        SET status = 'CANCELLED', stage = 'CANCELLED', next_retry_at = NULL,
+            error = ?, finished_at = ?, updated_at = ?
+        WHERE job_id = ? AND status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')
+      `).run(reason, now, now, id);
+      this.db.prepare(`
+        UPDATE transfer_jobs
+        SET status = 'CANCELLED', error = ?, finished_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(reason, now, now, id);
+    })();
+    return this.getJob(id);
+  }
+
+  resumeJob(id) {
+    const job = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(id);
+    if (!job) return null;
+    if (job.status !== "CANCELLED") return this.getJob(id);
+    const now = nowIso();
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE transfer_items
+        SET status = 'QUEUED', stage = CASE WHEN home_verified_at IS NULL THEN 'PENDING' ELSE 'HOME_VERIFIED' END,
+            next_retry_at = NULL, error = NULL, finished_at = NULL, updated_at = ?
+        WHERE job_id = ? AND status = 'CANCELLED'
+      `).run(now, id);
+      this.db.prepare(`
+        UPDATE transfer_jobs
+        SET status = 'QUEUED', error = NULL, finished_at = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(now, id);
+    })();
+    return this.getJob(id);
+  }
+
   getCheckpoint(id) {
     const row = this.db.prepare("SELECT checkpoint_json FROM transfer_items WHERE id = ?").get(id);
     return parseJson(row?.checkpoint_json, null);
@@ -671,6 +751,8 @@ export class LifecycleStore {
   }
 
   refreshJob(jobId) {
+    const currentStatus = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(jobId)?.status;
+    if (currentStatus === "CANCELLED") return;
     const summary = this.db.prepare(`
       SELECT
         COUNT(*) AS total_count,
@@ -707,7 +789,10 @@ export class LifecycleStore {
   listRecentJobs(limit = 10) {
     return this.db.prepare("SELECT * FROM transfer_jobs ORDER BY created_at DESC LIMIT ?")
       .all(Math.max(1, Math.min(100, limit)))
-      .map((row) => serializeJob(row));
+      .map((row) => ({
+        ...serializeJob(row),
+        diagnostics: this.getJobDiagnostics(row.id),
+      }));
   }
 
   createCachePushJob(input) {
