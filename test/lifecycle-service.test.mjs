@@ -232,7 +232,7 @@ test("page configuration refresh replaces stale MinIO credentials and rejected b
   }
 });
 
-test("permanent source HTTP errors fail immediately instead of blocking a batch in retry wait", async () => {
+test("a missing source is attempted once plus three retries before it is reported", async () => {
   const body = Buffer.from("missing-source");
   const context = await setupService({ body, sourceStatus: 404 });
   try {
@@ -250,12 +250,23 @@ test("permanent source HTTP errors fail immediately instead of blocking a batch 
       }],
     });
 
-    await context.service.processItem(job.items[0].id);
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      await context.service.processItem(job.items[0].id);
+      const current = context.store.getJob(job.id).items[0];
+      assert.equal(current.attemptCount, attempt);
+      if (attempt < 4) {
+        assert.equal(current.status, "RETRY_WAIT");
+        context.store.db.prepare("UPDATE transfer_items SET next_retry_at = NULL WHERE id = ?").run(current.id);
+      }
+    }
     const failed = context.store.getJob(job.id);
     assert.equal(failed.status, "FAILED");
     assert.equal(failed.items[0].status, "FAILED");
-    assert.equal(failed.items[0].attemptCount, 1);
+    assert.equal(failed.items[0].attemptCount, 4);
     assert.equal(failed.items[0].nextRetryAt, null);
+    assert.equal(failed.items[0].failureKind, "SOURCE_MISSING");
+    assert.equal(failed.items[0].retryable, false);
+    assert.equal(context.stats.sourceFetchCount, 4);
     assert.match(failed.items[0].error, /HTTP 404/);
   } finally {
     await cleanup(context);
@@ -295,19 +306,42 @@ test("one missing source is reported without preventing other manifest items fro
       },
     ]);
     context.store.completeManifest(run.id);
-    context.service.fetch = async (url) => String(url).includes("/missing.png")
-      ? new Response(null, { status: 404 })
-      : new Response(body, { headers: { "content-length": String(body.length), "content-type": "image/png" } });
+    const fetchCounts = new Map();
+    context.service.fetch = async (url) => {
+      const key = String(url).includes("/missing.png") ? "missing" : "present";
+      fetchCounts.set(key, (fetchCounts.get(key) || 0) + 1);
+      return key === "missing"
+        ? new Response(null, { status: 404 })
+        : new Response(body, { headers: { "content-length": String(body.length), "content-type": "image/png" } });
+    };
 
-    for (const item of context.store.getJob(run.id).items) await context.service.processItem(item.id);
+    const items = context.store.getJob(run.id).items;
+    const missing = items.find((item) => item.objectKey.endsWith("/missing.png"));
+    const present = items.find((item) => item.objectKey.endsWith("/present.png"));
+    await context.service.processItem(missing.id);
+    await context.service.processItem(present.id);
+    assert.equal(context.store.listRunnableCallbacks().length, 0);
+
+    for (let retry = 0; retry < 3; retry += 1) {
+      context.store.db.prepare("UPDATE transfer_items SET next_retry_at = NULL WHERE id = ?").run(missing.id);
+      await context.service.processItem(missing.id);
+    }
 
     const completed = context.store.getJob(run.id);
-    assert.equal(completed.status, "FAILED");
+    assert.equal(completed.status, "RESULTS_PENDING");
     assert.equal(completed.processedCount, 2);
     assert.equal(completed.succeededCount, 1);
     assert.equal(completed.failedCount, 1);
     assert.deepEqual(completed.items.map((item) => item.status).sort(), ["FAILED", "SUCCEEDED"]);
     assert.equal(context.store.db.prepare("SELECT COUNT(*) AS count FROM callback_outbox WHERE run_id = ?").get(run.id).count, 2);
+    assert.equal(context.store.listRunnableCallbacks().length, 2);
+    assert.equal(fetchCounts.get("missing"), 4);
+    assert.equal(fetchCounts.get("present"), 1);
+
+    const callbacks = context.store.listRunnableCallbacks();
+    const claimed = context.store.claimCallbacks(callbacks.map((item) => item.id));
+    context.store.markCallbacksDelivered(claimed.map((item) => item.id));
+    assert.equal(context.store.getJobSummary(run.id).status, "SUCCEEDED_WITH_ERRORS");
   } finally {
     await cleanup(context);
   }

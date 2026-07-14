@@ -8,7 +8,8 @@ import { pipeline } from "node:stream/promises";
 import OSS from "ali-oss";
 import { createMinioSignedHttpClient } from "./minio-signed-http.mjs";
 
-const MAX_ATTEMPTS = 10;
+// One initial attempt plus three retries. A failed item must not block the rest of the run.
+const MAX_ITEM_ATTEMPTS = 4;
 const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 410]);
@@ -469,7 +470,9 @@ export class LifecycleTransferService {
     if (!claimed.length) return;
     this.activeCallbackRuns.add(first.runId);
     void this.deliverCallbacks(claimed)
-      .catch((error) => console.warn(`[home-minio] lifecycle callback ${first.runId} failed: ${error instanceof Error ? error.message : String(error)}`))
+      .catch((error) => console.warn(
+        `[home-minio] lifecycle callback ${first.runId} sequences ${claimed[0]?.sequence}-${claimed[claimed.length - 1]?.sequence} failed: ${error instanceof Error ? error.message : String(error)}`,
+      ))
       .finally(() => {
         this.activeCallbackRuns.delete(first.runId);
         if (!this.stopped) queueMicrotask(() => this.kickCallbacks());
@@ -493,7 +496,11 @@ export class LifecycleTransferService {
           items: callbacks.map((callback) => ({ sequence: callback.sequence, result: callback.payload })),
         }),
       });
-      if (!response.ok) throw new Error(`NewWaule callback failed with HTTP ${response.status}.`);
+      if (!response.ok) {
+        const responseText = await response.text().catch(() => "");
+        const details = redactLifecycleMessage(responseText, [first.callbackToken]).slice(0, 1000);
+        throw new Error(`NewWaule callback failed with HTTP ${response.status}${details ? `: ${details}` : "."}`);
+      }
       this.store.markCallbacksDelivered(callbacks.map((item) => item.id));
     } catch (error) {
       this.store.markCallbacksRetry(callbacks.map((item) => item.id), error instanceof Error ? error.message : String(error));
@@ -913,7 +920,7 @@ export class LifecycleTransferService {
         ],
       );
       const failure = lifecycleFailureDetails(error);
-      const failed = !failure.retryable || item.attemptCount >= MAX_ATTEMPTS;
+      const failed = item.attemptCount >= MAX_ITEM_ATTEMPTS;
       const nextRetryAt = failed ? null : this.retryAt(item.attemptCount);
       this.store.updateItem(item.id, {
         status: failed ? "FAILED" : "RETRY_WAIT",

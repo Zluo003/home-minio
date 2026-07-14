@@ -3,8 +3,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 3;
-const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
+const SCHEMA_VERSION = 4;
+const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "SUCCEEDED_WITH_ERRORS", "FAILED", "CANCELLED"]);
 const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
 export class LifecycleConflictError extends Error {
@@ -519,6 +519,46 @@ export class LifecycleStore {
         `);
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(3, nowIso());
       })();
+      current = 3;
+    }
+    if (current < 4) {
+      this.db.transaction(() => {
+        const migratedAt = nowIso();
+        this.db.prepare(`
+          UPDATE callback_outbox
+          SET status = 'QUEUED', attempt_count = 0, next_retry_at = NULL,
+              error = NULL, updated_at = ?
+          WHERE status = 'FAILED'
+            AND run_id IN (
+              SELECT jobs.id
+              FROM transfer_jobs jobs
+              WHERE jobs.callback_url IS NOT NULL
+                AND jobs.manifest_status = 'SEALED'
+                AND NOT EXISTS (
+                  SELECT 1 FROM transfer_items items
+                  WHERE items.job_id = jobs.id
+                    AND items.status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')
+                )
+            )
+        `).run(migratedAt);
+        this.db.prepare(`
+          UPDATE transfer_jobs
+          SET status = 'RESULTS_PENDING', error = NULL, finished_at = NULL, updated_at = ?
+          WHERE callback_url IS NOT NULL
+            AND manifest_status = 'SEALED'
+            AND NOT EXISTS (
+              SELECT 1 FROM transfer_items items
+              WHERE items.job_id = transfer_jobs.id
+                AND items.status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')
+            )
+            AND EXISTS (
+              SELECT 1 FROM callback_outbox callbacks
+              WHERE callbacks.run_id = transfer_jobs.id
+                AND callbacks.status != 'DELIVERED'
+            )
+        `).run(migratedAt);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(4, migratedAt);
+      })();
     }
   }
 
@@ -550,6 +590,25 @@ export class LifecycleStore {
       SET status = 'RETRY_WAIT', next_retry_at = ?, error = COALESCE(error, 'Recovered after process restart'), updated_at = ?
       WHERE status = 'SENDING'
     `).run(now, now);
+
+    // A process can stop after persisting an item's terminal state but before
+    // creating its outbox row. Rebuild those rows so result delivery cannot
+    // remain permanently blocked by the all-items barrier.
+    const missingCallbacks = this.db.prepare(`
+      SELECT items.id
+      FROM transfer_items items
+      JOIN transfer_jobs jobs ON jobs.id = items.job_id
+      LEFT JOIN callback_outbox callbacks
+        ON callbacks.run_id = items.job_id AND callbacks.item_id = items.id
+      WHERE jobs.callback_url IS NOT NULL
+        AND jobs.callback_token IS NOT NULL
+        AND jobs.manifest_status = 'SEALED'
+        AND jobs.status NOT IN ('CANCELLED', 'FAILED')
+        AND items.status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+        AND callbacks.id IS NULL
+      ORDER BY jobs.created_at, items.created_at, items.id
+    `).all();
+    for (const item of missingCallbacks) this.enqueueItemCallback(item.id);
   }
 
   close() {
@@ -1007,6 +1066,7 @@ export class LifecycleStore {
       this.db.prepare("UPDATE transfer_jobs SET last_callback_sequence = ?, updated_at = ? WHERE id = ?")
         .run(sequence, now, itemRow.job_id);
     })();
+    this.refreshJob(itemRow.job_id);
     return serializeCallback(this.db.prepare("SELECT * FROM callback_outbox WHERE id = ?").get(callbackId));
   }
 
@@ -1015,8 +1075,24 @@ export class LifecycleStore {
       SELECT c.*, j.callback_url, j.callback_token
       FROM callback_outbox c
       JOIN transfer_jobs j ON j.id = c.run_id
-      WHERE c.status = 'QUEUED'
-         OR (c.status = 'RETRY_WAIT' AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?))
+      WHERE (
+          c.status = 'QUEUED'
+          OR (c.status = 'RETRY_WAIT' AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?))
+        )
+        AND j.manifest_status = 'SEALED'
+        AND j.status NOT IN ('CANCELLED', 'FAILED')
+        AND NOT EXISTS (
+          SELECT 1 FROM transfer_items active_items
+          WHERE active_items.job_id = c.run_id
+            AND active_items.status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT')
+        )
+        AND (
+          SELECT COUNT(*) FROM callback_outbox all_callbacks
+          WHERE all_callbacks.run_id = c.run_id
+        ) = (
+          SELECT COUNT(*) FROM transfer_items all_items
+          WHERE all_items.job_id = c.run_id
+        )
       ORDER BY c.run_id, c.sequence
       LIMIT ?
     `).all(nowIso(), Math.max(1, Math.min(1000, limit))).map((row) => ({
@@ -1052,19 +1128,22 @@ export class LifecycleStore {
     const uniqueIds = [...new Set((ids || []).filter(Boolean))];
     if (!uniqueIds.length) return;
     const placeholders = uniqueIds.map(() => "?").join(",");
+    const runIds = this.db.prepare(`SELECT DISTINCT run_id FROM callback_outbox WHERE id IN (${placeholders})`)
+      .all(...uniqueIds).map((row) => row.run_id);
     const now = nowIso();
     this.db.prepare(`
       UPDATE callback_outbox
       SET status = 'DELIVERED', delivered_at = ?, next_retry_at = NULL, error = NULL, updated_at = ?
       WHERE id IN (${placeholders})
     `).run(now, now, ...uniqueIds);
+    for (const runId of runIds) this.refreshJob(runId);
   }
 
   markCallbacksRetry(ids, error) {
     const uniqueIds = [...new Set((ids || []).filter(Boolean))];
     if (!uniqueIds.length) return;
     const placeholders = uniqueIds.map(() => "?").join(",");
-    const rows = this.db.prepare(`SELECT id, attempt_count FROM callback_outbox WHERE id IN (${placeholders})`).all(...uniqueIds);
+    const rows = this.db.prepare(`SELECT id, run_id, attempt_count FROM callback_outbox WHERE id IN (${placeholders})`).all(...uniqueIds);
     const update = this.db.prepare(`
       UPDATE callback_outbox SET status = ?, next_retry_at = ?, error = ?, updated_at = ? WHERE id = ?
     `);
@@ -1081,13 +1160,14 @@ export class LifecycleStore {
         );
       }
     })();
+    for (const runId of new Set(rows.map((row) => row.run_id))) this.refreshJob(runId);
   }
 
   cancelJob(id, reason = "Cancelled by administrator", summaryOnly = false) {
     const readResult = () => summaryOnly ? this.getJobSummary(id) : this.getJob(id);
     const job = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(id);
     if (!job) return null;
-    if (job.status === "SUCCEEDED" || job.status === "FAILED") return readResult();
+    if (["SUCCEEDED", "SUCCEEDED_WITH_ERRORS", "FAILED"].includes(job.status)) return readResult();
     const now = nowIso();
     this.db.transaction(() => {
       this.db.prepare(`
@@ -1113,7 +1193,7 @@ export class LifecycleStore {
     const callbackResetAt = nowIso();
     this.db.prepare(`
       UPDATE callback_outbox
-      SET status = 'QUEUED', next_retry_at = NULL, error = NULL, updated_at = ?
+      SET status = 'QUEUED', attempt_count = 0, next_retry_at = NULL, error = NULL, updated_at = ?
       WHERE run_id = ? AND status = 'FAILED'
     `).run(callbackResetAt, id);
     if (job.manifest_status !== "SEALED") {
@@ -1135,13 +1215,14 @@ export class LifecycleStore {
         `).run(now, id);
         this.db.prepare(`
           UPDATE callback_outbox
-          SET status = 'QUEUED', next_retry_at = NULL, error = NULL, updated_at = ?
+          SET status = 'QUEUED', attempt_count = 0, next_retry_at = NULL, error = NULL, updated_at = ?
           WHERE run_id = ? AND status = 'FAILED'
         `).run(now, id);
       })();
       return this.getJobSummary(id);
     }
     this.resumeJob(id);
+    this.refreshJob(id);
     return this.getJobSummary(id);
   }
 
@@ -1165,7 +1246,7 @@ export class LifecycleStore {
       `).run(now, id);
       this.db.prepare(`
         UPDATE callback_outbox
-        SET status = 'QUEUED', next_retry_at = NULL, error = NULL, updated_at = ?
+        SET status = 'QUEUED', attempt_count = 0, next_retry_at = NULL, error = NULL, updated_at = ?
         WHERE run_id = ? AND status = 'FAILED'
       `).run(now, id);
     })();
@@ -1193,8 +1274,8 @@ export class LifecycleStore {
   }
 
   refreshJob(jobId) {
-    const currentStatus = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(jobId)?.status;
-    if (currentStatus === "CANCELLED") return;
+    const current = this.db.prepare("SELECT status, callback_url, error FROM transfer_jobs WHERE id = ?").get(jobId);
+    if (!current || current.status === "CANCELLED") return;
     const summary = this.db.prepare(`
       SELECT
         COUNT(*) AS total_count,
@@ -1207,14 +1288,50 @@ export class LifecycleStore {
     `).get(jobId);
     let status = "RUNNING";
     let finishedAt = null;
+    let jobError = current.error;
     if (summary.active_count === 0) {
-      status = summary.failed_count > 0 ? "FAILED" : "SUCCEEDED";
-      finishedAt = nowIso();
+      if (current.callback_url) {
+        let callbacks = this.getCallbackDeliverySummary(jobId);
+        if (["RUNNING", "QUEUED"].includes(current.status) && callbacks.callbackFailedCount > 0) {
+          const resetAt = nowIso();
+          this.db.prepare(`
+            UPDATE callback_outbox
+            SET status = 'QUEUED', attempt_count = 0, next_retry_at = NULL,
+                error = NULL, updated_at = ?
+            WHERE run_id = ? AND status = 'FAILED'
+          `).run(resetAt, jobId);
+          callbacks = this.getCallbackDeliverySummary(jobId);
+        }
+        if (callbacks.callbackFailedCount > 0) {
+          status = "CALLBACK_FAILED";
+          jobError = this.db.prepare(`
+            SELECT error FROM callback_outbox
+            WHERE run_id = ? AND status = 'FAILED' AND error IS NOT NULL
+            ORDER BY updated_at DESC LIMIT 1
+          `).get(jobId)?.error || "NewWaule result delivery failed.";
+        } else if (
+          callbacks.callbackTotalCount < summary.processed_count ||
+          callbacks.callbackPendingCount > 0 ||
+          callbacks.callbackDeliveredCount < summary.processed_count
+        ) {
+          status = "RESULTS_PENDING";
+          jobError = null;
+        } else {
+          status = summary.failed_count > 0 ? "SUCCEEDED_WITH_ERRORS" : "SUCCEEDED";
+          finishedAt = nowIso();
+          jobError = null;
+        }
+      } else {
+        status = summary.failed_count > 0 ? "FAILED" : "SUCCEEDED";
+        finishedAt = nowIso();
+      }
+    } else if (current.callback_url) {
+      jobError = null;
     }
     this.db.prepare(`
       UPDATE transfer_jobs
       SET status = ?, processed_count = ?, succeeded_count = ?, failed_count = ?, processed_bytes = ?,
-          finished_at = COALESCE(?, finished_at), updated_at = ?
+          error = ?, finished_at = ?, updated_at = ?
       WHERE id = ?
     `).run(
       status,
@@ -1222,6 +1339,7 @@ export class LifecycleStore {
       summary.succeeded_count,
       summary.failed_count,
       summary.processed_bytes,
+      jobError,
       finishedAt,
       nowIso(),
       jobId,

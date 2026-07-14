@@ -56,7 +56,7 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
     assert.equal(store.db.pragma("journal_mode", { simple: true }), "wal");
     assert.equal(store.db.pragma("foreign_keys", { simple: true }), 1);
     assert.ok(store.db.pragma("busy_timeout", { simple: true }) >= 5_000);
-    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 3);
+    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 4);
   });
 });
 
@@ -113,13 +113,13 @@ test("existing v2 lifecycle state upgrades to streaming runs without losing jobs
     ALTER TABLE transfer_jobs DROP COLUMN manifest_attempt_count;
     ALTER TABLE transfer_jobs DROP COLUMN manifest_next_retry_at;
     ALTER TABLE transfer_jobs DROP COLUMN last_callback_sequence;
-    DELETE FROM schema_migrations WHERE version = 3;
+    DELETE FROM schema_migrations WHERE version >= 3;
   `);
   first.close();
 
   const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 3);
+    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 4);
     assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM transfer_items").get().count, 1);
     assert.equal(second.getJob("run-before-v2").items[0].home, null);
     assert.ok(second.db.pragma("table_info(transfer_items)").some((column) => column.name === "home_reused"));
@@ -257,6 +257,18 @@ test("manifest ingestion and callback delivery recover after process restart", a
     assert.equal(recovered.status, "INGESTING");
     assert.equal(recovered.manifestStatus, "RETRY_WAIT");
     assert.deepEqual(second.listManifestRuns(), [run.id]);
+    assert.equal(second.listRunnableCallbacks().length, 0);
+
+    assert.ok(second.claimManifestRun(run.id));
+    second.appendManifestItems(run.id, [{
+      lifecycleObjectId: "object-recovery",
+      objectKey: "gateway-media/recovery.png",
+      sourceUrl: "https://api.example.test/local-media/gateway-media/recovery.png",
+      targetTier: "COLD_HOME_MINIO",
+      expectedSizeBytes: 8,
+      mimeType: "image/png",
+    }]);
+    second.completeManifest(run.id);
     const callbacks = second.listRunnableCallbacks();
     assert.equal(callbacks.length, 1);
     assert.equal(callbacks[0].status, "RETRY_WAIT");
@@ -303,18 +315,178 @@ test("exhausted callbacks are visible and can be resumed without rerunning compl
     }
 
     const failed = store.getJobSummary(run.id);
-    assert.equal(failed.status, "SUCCEEDED");
+    assert.equal(failed.status, "CALLBACK_FAILED");
     assert.equal(failed.callbackTotalCount, 1);
     assert.equal(failed.callbackDeliveredCount, 0);
     assert.equal(failed.callbackPendingCount, 0);
     assert.equal(failed.callbackFailedCount, 1);
 
     const resumed = store.resumeStreamingJob(run.id);
-    assert.equal(resumed.status, "SUCCEEDED");
+    assert.equal(resumed.status, "RESULTS_PENDING");
     assert.equal(resumed.callbackFailedCount, 0);
     assert.equal(resumed.callbackPendingCount, 1);
     assert.equal(store.listRunnableCallbacks()[0].id, callback.id);
     assert.equal(store.getJob(run.id).items[0].status, "SUCCEEDED");
+
+    const claimed = store.claimCallbacks([callback.id]);
+    store.markCallbacksDelivered(claimed.map((item) => item.id));
+    assert.equal(store.getJobSummary(run.id).status, "SUCCEEDED");
+  });
+});
+
+test("schema v4 restores exhausted callbacks for completed legacy runs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "home-minio-v4-callback-upgrade-"));
+  const dbPath = join(root, "state.sqlite");
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
+  const run = first.createStreamingJob({
+    id: "v4-callback-recovery",
+    mediaKind: "GENERATED_MEDIA",
+    expectedCount: 1,
+    manifestUrl: "https://api.example.test/internal/v4-callback-recovery/manifest",
+    manifestToken: "manifest-token",
+    callbackUrl: "https://api.example.test/internal/v4-callback-recovery/results",
+    callbackToken: "callback-token",
+  });
+  first.claimManifestRun(run.id);
+  first.appendManifestItems(run.id, [{
+    lifecycleObjectId: "v4-callback-object",
+    objectKey: "gateway-media/v4-callback-object.png",
+    sourceUrl: "https://api.example.test/local-media/gateway-media/v4-callback-object.png",
+    targetTier: "COLD_HOME_MINIO",
+    expectedSizeBytes: 8,
+  }]);
+  first.completeManifest(run.id);
+  const itemId = first.db.prepare("SELECT id FROM transfer_items WHERE job_id = ?").get(run.id).id;
+  first.updateItem(itemId, {
+    status: "SUCCEEDED",
+    stage: "COMPLETED",
+    homeSizeBytes: 8,
+    homeVerifiedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+  });
+  const callback = first.enqueueItemCallback(itemId);
+  first.db.prepare(`
+    UPDATE callback_outbox
+    SET status = 'FAILED', attempt_count = 10, error = 'legacy callback failure'
+    WHERE id = ?
+  `).run(callback.id);
+  first.db.prepare("UPDATE transfer_jobs SET status = 'FAILED', error = 'legacy callback failure' WHERE id = ?").run(run.id);
+  first.db.prepare("DELETE FROM schema_migrations WHERE version = 4").run();
+  first.close();
+
+  const second = new LifecycleStore({ dbPath, encryptionKey: null });
+  try {
+    const recovered = second.getJobSummary(run.id);
+    assert.equal(recovered.status, "RESULTS_PENDING");
+    assert.equal(recovered.callbackFailedCount, 0);
+    assert.equal(recovered.callbackPendingCount, 1);
+    assert.equal(second.listRunnableCallbacks()[0].id, callback.id);
+  } finally {
+    second.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recreates an outbox row missing after a terminal item commit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "home-minio-callback-gap-"));
+  const dbPath = join(root, "state.sqlite");
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
+  const run = first.createStreamingJob({
+    id: "callback-gap-recovery",
+    mediaKind: "GENERATED_MEDIA",
+    expectedCount: 1,
+    manifestUrl: "https://api.example.test/internal/callback-gap-recovery/manifest",
+    manifestToken: "manifest-token",
+    callbackUrl: "https://api.example.test/internal/callback-gap-recovery/results",
+    callbackToken: "callback-token",
+  });
+  first.claimManifestRun(run.id);
+  first.appendManifestItems(run.id, [{
+    lifecycleObjectId: "callback-gap-object",
+    objectKey: "gateway-media/callback-gap-object.png",
+    sourceUrl: "https://api.example.test/local-media/gateway-media/callback-gap-object.png",
+    targetTier: "COLD_HOME_MINIO",
+    expectedSizeBytes: 8,
+  }]);
+  first.completeManifest(run.id);
+  const itemId = first.db.prepare("SELECT id FROM transfer_items WHERE job_id = ?").get(run.id).id;
+  first.updateItem(itemId, {
+    status: "SUCCEEDED",
+    stage: "COMPLETED",
+    homeSizeBytes: 8,
+    homeVerifiedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+  });
+  assert.equal(first.getJobSummary(run.id).callbackTotalCount, 0);
+  first.close();
+
+  const second = new LifecycleStore({ dbPath, encryptionKey: null });
+  try {
+    const recovered = second.getJobSummary(run.id);
+    assert.equal(recovered.status, "RESULTS_PENDING");
+    assert.equal(recovered.callbackTotalCount, 1);
+    assert.equal(second.listRunnableCallbacks().length, 1);
+  } finally {
+    second.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelled streaming runs do not deliver callbacks until the same run is resumed", async () => {
+  await withStore(({ store }) => {
+    const run = store.createStreamingJob({
+      id: "cancelled-callback-barrier",
+      mediaKind: "GENERATED_MEDIA",
+      expectedCount: 2,
+      manifestUrl: "https://api.example.test/internal/cancelled-callback-barrier/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/cancelled-callback-barrier/results",
+      callbackToken: "callback-token",
+    });
+    store.claimManifestRun(run.id);
+    store.appendManifestItems(run.id, [
+      {
+        lifecycleObjectId: "cancelled-complete-object",
+        objectKey: "gateway-media/cancelled-complete.png",
+        sourceUrl: "https://api.example.test/local-media/gateway-media/cancelled-complete.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: 8,
+      },
+      {
+        lifecycleObjectId: "cancelled-pending-object",
+        objectKey: "gateway-media/cancelled-pending.png",
+        sourceUrl: "https://api.example.test/local-media/gateway-media/cancelled-pending.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: 8,
+      },
+    ]);
+    store.completeManifest(run.id);
+    const [completeItem, pendingItem] = store.getJob(run.id).items;
+    store.updateItem(completeItem.id, {
+      status: "SUCCEEDED",
+      stage: "COMPLETED",
+      homeSizeBytes: 8,
+      homeVerifiedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    });
+    store.enqueueItemCallback(completeItem.id);
+    store.cancelJob(run.id);
+
+    assert.equal(store.listRunnableCallbacks().length, 0);
+    assert.equal(store.getJob(run.id).items.find((item) => item.id === pendingItem.id).status, "CANCELLED");
+
+    const resumed = store.resumeStreamingJob(run.id);
+    assert.equal(resumed.status, "RUNNING");
+    assert.equal(store.listRunnableCallbacks().length, 0);
+    store.updateItem(pendingItem.id, {
+      status: "SUCCEEDED",
+      stage: "COMPLETED",
+      homeSizeBytes: 8,
+      homeVerifiedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    });
+    store.enqueueItemCallback(pendingItem.id);
+    assert.equal(store.listRunnableCallbacks().length, 2);
   });
 });
 
