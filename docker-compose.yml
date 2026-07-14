@@ -78,10 +78,13 @@ services:
     restart: unless-stopped
     depends_on:
       - web-api
+    environment:
+      HOME_MINIO_WEB_API_PORT: ${HOME_MINIO_WEB_API_PORT:-19090}
     ports:
       - "${HOME_MINIO_BIND_ADDRESS:-0.0.0.0}:${HOME_MINIO_WEB_PORT:-19091}:80"
     volumes:
       - ./web/frontend:/usr/share/nginx/html:ro
+      - ./web/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
 
   backup-scheduler:
     image: node:22-alpine

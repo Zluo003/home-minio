@@ -1,6 +1,6 @@
 import { CONFIG_PAGES } from "./config-schema.js";
 
-const API_BASE = `${location.protocol}//${location.hostname}:19090`;
+const API_BASE = location.origin;
 let token = localStorage.getItem("homeMinioToken") || "";
 let configState = { values: {}, configuredKeys: new Set(), editableKeys: new Set() };
 let messageTimer = null;
@@ -340,7 +340,15 @@ document.getElementById("copyConfigButton").addEventListener("click", async () =
 });
 
 setPage(location.hash.slice(1));
-await Promise.all([loadConfig(), loadStatus()]);
+try {
+  await Promise.all([loadConfig(), loadStatus()]);
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  document.getElementById("statusText").textContent = "连接失败";
+  document.getElementById("overviewTransferStatus").textContent = message;
+  document.getElementById("transferStatus").textContent = message;
+  showMessage(message, "error");
+}
 let statusRefreshRunning = false;
 setInterval(() => {
   if (document.hidden || statusRefreshRunning) return;
