@@ -179,6 +179,7 @@ function serializeItem(row) {
           sizeBytes: row.home_size_bytes,
           etag: row.home_etag,
           sha256: row.home_sha256,
+          reused: row.home_reused == null ? null : Boolean(row.home_reused),
           verifiedAt: row.home_verified_at,
         }
       : null,
@@ -307,7 +308,7 @@ export class LifecycleStore {
         applied_at TEXT NOT NULL
       );
     `);
-    const current = this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version;
+    let current = this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version;
     if (current < 1) {
       this.db.exec(`
         CREATE TABLE oss_config_versions (
@@ -404,6 +405,11 @@ export class LifecycleStore {
         CREATE INDEX cache_push_jobs_runnable_idx ON cache_push_jobs(status, next_retry_at, created_at);
       `);
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, nowIso());
+      current = 1;
+    }
+    if (current < 2) {
+      this.db.exec("ALTER TABLE transfer_items ADD COLUMN home_reused INTEGER;");
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, nowIso());
     }
   }
 
@@ -662,7 +668,7 @@ export class LifecycleStore {
   updateItem(id, values) {
     const allowed = new Map([
       ["status", "status"], ["stage", "stage"], ["nextRetryAt", "next_retry_at"],
-      ["homeSizeBytes", "home_size_bytes"], ["homeEtag", "home_etag"], ["homeSha256", "home_sha256"], ["homeVerifiedAt", "home_verified_at"],
+      ["homeSizeBytes", "home_size_bytes"], ["homeEtag", "home_etag"], ["homeSha256", "home_sha256"], ["homeReused", "home_reused"], ["homeVerifiedAt", "home_verified_at"],
       ["ossBucket", "oss_bucket"], ["ossSizeBytes", "oss_size_bytes"], ["ossEtag", "oss_etag"], ["ossDirectUrl", "oss_direct_url"],
       ["ossSelectedUrl", "oss_selected_url"], ["ossCdnVerified", "oss_cdn_verified"], ["ossVerifiedAt", "oss_verified_at"],
       ["checkpoint", "checkpoint_json"], ["warning", "warning"], ["error", "error"], ["finishedAt", "finished_at"],
@@ -673,7 +679,13 @@ export class LifecycleStore {
       const column = allowed.get(key);
       if (!column) continue;
       assignments.push(`${column} = ?`);
-      parameters.push(key === "checkpoint" ? (value == null ? null : JSON.stringify(value)) : key === "ossCdnVerified" ? (value ? 1 : 0) : value);
+      parameters.push(
+        key === "checkpoint"
+          ? (value == null ? null : JSON.stringify(value))
+          : key === "ossCdnVerified" || key === "homeReused"
+            ? (value == null ? null : value ? 1 : 0)
+            : value,
+      );
     }
     if (!assignments.length) return this.getItem(id);
     assignments.push("updated_at = ?");

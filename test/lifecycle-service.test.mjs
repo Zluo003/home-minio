@@ -343,6 +343,35 @@ test("an existing same-size Home object is overwritten when its SHA-256 is wrong
   }
 });
 
+test("a verified existing Home object succeeds without downloading a deleted source", async () => {
+  const body = Buffer.from("already-cold-home-object");
+  const context = await setupService({ body, sourceStatus: 404 });
+  try {
+    const objectKey = "New-Waule/uploads/2026/04/17/already-cold.png";
+    context.minio.objects.set(objectKey, body);
+    const job = context.store.createJob({
+      id: "reuse-cold-home-run",
+      mediaKind: "WORKFLOW_UPLOAD",
+      items: [{
+        lifecycleObjectId: "media-reuse-cold-home",
+        objectKey,
+        sourceUrl: `https://source.example.test/local-media/${objectKey}`,
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: body.length,
+        mimeType: "image/png",
+      }],
+    });
+
+    await context.service.processItem(job.items[0].id);
+    const completed = context.store.getJob(job.id);
+    assert.equal(completed.status, "SUCCEEDED");
+    assert.equal(completed.items[0].home.reused, true);
+    assert.equal(context.stats.sourceFetchCount, 0);
+  } finally {
+    await cleanup(context);
+  }
+});
+
 test("an unverified existing Home object is replaced when source size and hash are unknown", async () => {
   const body = Buffer.from("authoritative-source");
   const context = await setupService({ body });
@@ -503,6 +532,12 @@ test("concurrent jobs for one object share one Home copy", async () => {
     assert.equal(context.store.getJob("shared-run-a").status, "SUCCEEDED");
     assert.equal(context.store.getJob("shared-run-b").status, "SUCCEEDED");
     assert.equal(context.stats.sourceFetchCount, 1);
+    assert.deepEqual(
+      ["shared-run-a", "shared-run-b"]
+        .map((id) => context.store.getJob(id).items[0].home.reused)
+        .sort(),
+      [false, true],
+    );
     assert.ok(context.service.telemetry().transferredBytesLastMinute >= body.length);
   } finally {
     await cleanup(context);

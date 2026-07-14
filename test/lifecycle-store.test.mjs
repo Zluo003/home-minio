@@ -56,7 +56,63 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
     assert.equal(store.db.pragma("journal_mode", { simple: true }), "wal");
     assert.equal(store.db.pragma("foreign_keys", { simple: true }), 1);
     assert.ok(store.db.pragma("busy_timeout", { simple: true }) >= 5_000);
+    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 2);
   });
+});
+
+test("Home verification records whether an existing object was reused", async () => {
+  await withStore(({ store }) => {
+    const job = store.createJob({
+      id: "run-home-reused",
+      mediaKind: "WORKFLOW_UPLOAD",
+      items: [{
+        lifecycleObjectId: "object-home-reused",
+        objectKey: "New-Waule/uploads/already-cold.png",
+        sourceUrl: "https://api.example.test/local-media/New-Waule/uploads/already-cold.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: 12,
+      }],
+    });
+    store.updateItem(job.items[0].id, {
+      homeSizeBytes: 12,
+      homeReused: true,
+      homeVerifiedAt: new Date().toISOString(),
+    });
+    assert.equal(store.getJob(job.id).items[0].home.reused, true);
+  });
+});
+
+test("existing v1 lifecycle state upgrades to reuse tracking without losing jobs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "home-minio-v1-upgrade-"));
+  const dbPath = join(root, "state.sqlite");
+  const first = new LifecycleStore({ dbPath, encryptionKey: null });
+  first.createJob({
+    id: "run-before-v2",
+    mediaKind: "WORKFLOW_UPLOAD",
+    items: [{
+      lifecycleObjectId: "object-before-v2",
+      objectKey: "New-Waule/uploads/before-v2.png",
+      sourceUrl: "https://api.example.test/local-media/New-Waule/uploads/before-v2.png",
+      targetTier: "COLD_HOME_MINIO",
+      expectedSizeBytes: 12,
+    }],
+  });
+  first.db.exec(`
+    ALTER TABLE transfer_items DROP COLUMN home_reused;
+    DELETE FROM schema_migrations WHERE version = 2;
+  `);
+  first.close();
+
+  const second = new LifecycleStore({ dbPath, encryptionKey: null });
+  try {
+    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 2);
+    assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM transfer_items").get().count, 1);
+    assert.equal(second.getJob("run-before-v2").items[0].home, null);
+    assert.ok(second.db.pragma("table_info(transfer_items)").some((column) => column.name === "home_reused"));
+  } finally {
+    second.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("lifecycle state reopens without an external encryption key", async () => {

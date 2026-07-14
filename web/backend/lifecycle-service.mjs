@@ -377,7 +377,7 @@ export class LifecycleTransferService {
         : existing.sha256;
       const hashMatches = !expectedHomeSha256 || knownSha256 === expectedHomeSha256;
       if (hasVerificationEvidence && sizeMatches && hashMatches) {
-        return { ...existing, sha256: knownSha256 };
+        return { ...existing, sha256: knownSha256, reused: true };
       }
     }
     if (!sourceUrlMatchesObjectKey(item.sourceUrl, item.objectKey)) {
@@ -434,7 +434,7 @@ export class LifecycleTransferService {
     if (!verified || verified.sizeBytes !== copied.contentLength) {
       throw new Error("Home MinIO HEAD verification failed after upload.");
     }
-    return { ...verified, etag: verified.etag || copied.uploadEtag, sha256: copied.sha256 };
+    return { ...verified, etag: verified.etag || copied.uploadEtag, sha256: copied.sha256, reused: false };
   }
 
   async hashHomeObject(objectKey, signal) {
@@ -666,6 +666,7 @@ export class LifecycleTransferService {
         homeSizeBytes: home.sizeBytes,
         homeEtag: home.etag,
         homeSha256: home.sha256,
+        homeReused: home.reused,
         homeVerifiedAt: verifiedAt,
       });
 
