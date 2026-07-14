@@ -17,32 +17,26 @@ class FakeMinioClient {
     this.objects = new Map();
   }
 
-  async send(command) {
-    const name = command.constructor.name;
-    const input = command.input;
-    if (name === "HeadBucketCommand" || name === "CreateBucketCommand") return {};
-    if (name === "HeadObjectCommand") {
-      const value = this.objects.get(input.Key);
-      if (!value) {
-        const error = new Error("not found");
-        error.$metadata = { httpStatusCode: 404 };
-        throw error;
-      }
-      return { ContentLength: value.length, ETag: `"home-${value.length}"`, Metadata: {} };
-    }
-    if (name === "PutObjectCommand") {
-      const chunks = [];
-      for await (const chunk of input.Body) chunks.push(Buffer.from(chunk));
-      const value = Buffer.concat(chunks);
-      this.objects.set(input.Key, value);
-      return { ETag: `"home-${value.length}"` };
-    }
-    if (name === "GetObjectCommand") {
-      const value = this.objects.get(input.Key);
-      if (!value) throw new Error("missing fake object");
-      return { Body: Readable.from(value), ContentLength: value.length, ContentType: "application/octet-stream" };
-    }
-    throw new Error(`Unexpected MinIO command ${name}`);
+  async ensureBucket() {}
+
+  async headObject(key) {
+    const value = this.objects.get(key);
+    if (!value) return null;
+    return { sizeBytes: value.length, etag: `"home-${value.length}"`, sha256: null };
+  }
+
+  async putObject(key, body) {
+    const chunks = [];
+    for await (const chunk of body) chunks.push(Buffer.from(chunk));
+    const value = Buffer.concat(chunks);
+    this.objects.set(key, value);
+    return { etag: `"home-${value.length}"` };
+  }
+
+  async getObject(key) {
+    const value = this.objects.get(key);
+    if (!value) throw new Error("missing fake object");
+    return { body: Readable.from(value), sizeBytes: value.length, contentType: "application/octet-stream" };
   }
 
   destroy() {}
@@ -181,6 +175,47 @@ test("lifecycle error messages redact exact credentials and credential-shaped fi
   assert.equal(message.includes("oss-super-secret"), false);
   assert.equal(message.includes("home-token"), false);
   assert.equal(message.includes("BearerToken"), false);
+});
+
+test("page configuration refresh replaces stale MinIO credentials and rejected bucket checks", async () => {
+  let currentSecret = "stale-secret";
+  const createdWith = [];
+  const service = new LifecycleTransferService({
+    store: {},
+    env: {
+      MINIO_BUCKET: "media",
+      MINIO_WAULE_ACCESS_KEY: "waule-user",
+      MINIO_WAULE_SECRET_KEY: currentSecret,
+    },
+    environmentProvider: async () => ({
+      MINIO_BUCKET: "media",
+      MINIO_WAULE_ACCESS_KEY: "waule-user",
+      MINIO_WAULE_SECRET_KEY: currentSecret,
+    }),
+    minioClientFactory: (nextEnv) => {
+      const secret = nextEnv.MINIO_WAULE_SECRET_KEY;
+      createdWith.push(secret);
+      return {
+        async ensureBucket() {
+          if (secret === "stale-secret") {
+            const error = new Error("MinIO bucket HEAD failed with HTTP 403.");
+            error.statusCode = 403;
+            throw error;
+          }
+        },
+        destroy() {},
+      };
+    },
+  });
+  try {
+    await assert.rejects(service.ensureBucket(), /HTTP 403/);
+    currentSecret = "current-secret";
+    await service.refreshEnvironment();
+    await service.ensureBucket();
+    assert.deepEqual(createdWith, ["stale-secret", "current-secret"]);
+  } finally {
+    await service.stop();
+  }
 });
 
 test("permanent source HTTP errors fail immediately instead of blocking a batch in retry wait", async () => {

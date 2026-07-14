@@ -33,12 +33,20 @@ try {
   lifecycleStore = new LifecycleStore({ encryptionKey: null });
 }
 let lifecycleService = null;
+const lifecycleEnvironmentProvider = async () => ({
+  ...process.env,
+  ...(await readEnv()).values,
+});
 try {
   const lifecycleHealth = lifecycleStore.health();
   if (!lifecycleHealth.ready) {
     lifecycleStartupError = lifecycleStartupError || lifecycleHealth.encryptionError;
   } else {
-    lifecycleService = new LifecycleTransferService({ store: lifecycleStore, env: process.env });
+    lifecycleService = new LifecycleTransferService({
+      store: lifecycleStore,
+      env: await lifecycleEnvironmentProvider(),
+      environmentProvider: lifecycleEnvironmentProvider,
+    });
     lifecycleService.start();
   }
 } catch (error) {
@@ -549,6 +557,7 @@ async function handle(request, reply) {
       }
     }
     const values = await saveEnv(sanitized);
+    lifecycleService?.reconfigure({ ...process.env, ...values });
     return send(reply, 200, {
       values: sanitizeEditableValues(values),
       configuredKeys: [...secretEditableKeys].filter((key) => Boolean(values[key])),

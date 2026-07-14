@@ -4,16 +4,8 @@ import { mkdir, rm, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import {
-  CreateBucketCommand,
-  GetObjectCommand,
-  HeadBucketCommand,
-  HeadObjectCommand,
-  PutObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
 import OSS from "ali-oss";
-import { LifecycleValidationError } from "./lifecycle-store.mjs";
+import { createMinioSignedHttpClient } from "./minio-signed-http.mjs";
 
 const MAX_ATTEMPTS = 10;
 const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
@@ -142,20 +134,6 @@ class Semaphore {
   }
 }
 
-function createMinioClient(env) {
-  const accessKeyId = env.MINIO_WAULE_ACCESS_KEY || env.MINIO_ROOT_USER;
-  const secretAccessKey = env.MINIO_WAULE_SECRET_KEY || env.MINIO_ROOT_PASSWORD;
-  if (!accessKeyId || !secretAccessKey) {
-    throw new LifecycleValidationError("MinIO credentials are not configured.", 503);
-  }
-  return new S3Client({
-    endpoint: env.MINIO_INTERNAL_ENDPOINT || "http://minio:9000",
-    region: env.MINIO_REGION || "us-east-1",
-    forcePathStyle: true,
-    credentials: { accessKeyId, secretAccessKey },
-  });
-}
-
 function createOssClient(config) {
   const endpoint = config.endpoint.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
   return new OSS({
@@ -182,32 +160,83 @@ async function hashFile(filePath) {
   return hash.digest("hex");
 }
 
+function minioConnectionKey(env, bucket) {
+  return JSON.stringify([
+    env.MINIO_INTERNAL_ENDPOINT || env.MINIO_UPLOAD_ENDPOINT || "http://minio:9000",
+    env.MINIO_REGION || "us-east-1",
+    bucket,
+    env.MINIO_WAULE_ACCESS_KEY || env.MINIO_ROOT_USER || "",
+    env.MINIO_WAULE_SECRET_KEY || env.MINIO_ROOT_PASSWORD || "",
+  ]);
+}
+
 export class LifecycleTransferService {
   constructor(options) {
     this.store = options.store;
-    this.env = options.env || process.env;
     this.fetch = options.fetchImpl || globalThis.fetch;
-    this.minioClient = options.minioClient || createMinioClient(this.env);
     this.ossClientFactory = options.ossClientFactory || createOssClient;
-    this.bucket = this.env.MINIO_BUCKET || "waule-media";
-    this.workDir = resolve(this.env.HOME_MINIO_TRANSFER_WORK_DIR || "./transfer-work");
-    this.pullConcurrency = readInteger(this.env.MEDIA_PULL_CONCURRENCY, 4, { min: 1, max: 32 });
-    this.ossFileConcurrency = readInteger(this.env.OSS_FILE_CONCURRENCY, 8, { min: 1, max: 32 });
-    this.multipartConcurrency = readInteger(this.env.OSS_MULTIPART_CONCURRENCY, 4, { min: 1, max: 16 });
-    this.maxHttpConcurrency = readInteger(this.env.OSS_MAX_HTTP_CONCURRENCY, 16, { min: 1, max: 64 });
-    this.multipartThresholdBytes = readInteger(this.env.OSS_MULTIPART_THRESHOLD_BYTES, 64 * 1024 * 1024, { min: 5 * 1024 * 1024, max: 5 * 1024 * 1024 * 1024 });
-    this.partSizeBytes = readInteger(this.env.OSS_PART_SIZE_BYTES, 16 * 1024 * 1024, { min: 100 * 1024, max: 1024 * 1024 * 1024 });
-    this.pullSemaphore = new Semaphore(this.pullConcurrency);
-    this.ossSemaphore = new Semaphore(this.ossFileConcurrency);
-    this.workerSemaphore = new Semaphore(this.maxHttpConcurrency);
-    this.httpSemaphore = new Semaphore(this.maxHttpConcurrency);
+    this.environmentProvider = options.environmentProvider || null;
+    this.minioClientFactory = options.minioClientFactory
+      || ((env, bucket) => createMinioSignedHttpClient(env, { bucket }));
+    this.managedMinioClient = !options.minioClient;
+    this.minioClient = options.minioClient || null;
+    this.minioClientKey = options.minioClient ? "injected" : null;
     this.activeItemIds = new Set();
     this.activeObjectKeys = new Set();
     this.activeTransfers = new Map();
+    this.pendingEnvironment = null;
     this.byteSamples = [];
     this.timer = null;
     this.stopped = true;
     this.bucketReadyPromise = null;
+    this.applyEnvironment(options.env || process.env);
+  }
+
+  applyEnvironment(env) {
+    const nextEnv = { ...env };
+    const nextBucket = nextEnv.MINIO_BUCKET || "waule-media";
+    const nextClientKey = minioConnectionKey(nextEnv, nextBucket);
+    if (this.managedMinioClient && this.minioClientKey !== nextClientKey) {
+      this.minioClient?.destroy?.();
+      this.minioClient = this.minioClientFactory(nextEnv, nextBucket);
+      this.minioClientKey = nextClientKey;
+      this.bucketReadyPromise = null;
+    }
+    this.env = nextEnv;
+    this.bucket = nextBucket;
+    this.workDir = resolve(nextEnv.HOME_MINIO_TRANSFER_WORK_DIR || "./transfer-work");
+    this.pullConcurrency = readInteger(nextEnv.MEDIA_PULL_CONCURRENCY, 4, { min: 1, max: 32 });
+    this.ossFileConcurrency = readInteger(nextEnv.OSS_FILE_CONCURRENCY, 8, { min: 1, max: 32 });
+    this.multipartConcurrency = readInteger(nextEnv.OSS_MULTIPART_CONCURRENCY, 4, { min: 1, max: 16 });
+    this.maxHttpConcurrency = readInteger(nextEnv.OSS_MAX_HTTP_CONCURRENCY, 16, { min: 1, max: 64 });
+    this.multipartThresholdBytes = readInteger(nextEnv.OSS_MULTIPART_THRESHOLD_BYTES, 64 * 1024 * 1024, { min: 5 * 1024 * 1024, max: 5 * 1024 * 1024 * 1024 });
+    this.partSizeBytes = readInteger(nextEnv.OSS_PART_SIZE_BYTES, 16 * 1024 * 1024, { min: 100 * 1024, max: 1024 * 1024 * 1024 });
+    this.pullSemaphore = new Semaphore(this.pullConcurrency);
+    this.ossSemaphore = new Semaphore(this.ossFileConcurrency);
+    this.workerSemaphore = new Semaphore(this.maxHttpConcurrency);
+    this.httpSemaphore = new Semaphore(this.maxHttpConcurrency);
+  }
+
+  reconfigure(env) {
+    if (this.activeItemIds.size > 0 || this.activeTransfers.size > 0) {
+      this.pendingEnvironment = { ...env };
+      return false;
+    }
+    this.pendingEnvironment = null;
+    this.applyEnvironment(env);
+    return true;
+  }
+
+  async refreshEnvironment() {
+    if (!this.environmentProvider) return;
+    this.reconfigure(await this.environmentProvider());
+  }
+
+  applyPendingEnvironment() {
+    if (!this.pendingEnvironment || this.activeItemIds.size > 0 || this.activeTransfers.size > 0) return;
+    const nextEnv = this.pendingEnvironment;
+    this.pendingEnvironment = null;
+    this.applyEnvironment(nextEnv);
   }
 
   settings() {
@@ -243,17 +272,14 @@ export class LifecycleTransferService {
     };
   }
 
-  async ensureBucket() {
+  async ensureBucket(signal) {
     if (!this.bucketReadyPromise) {
-      this.bucketReadyPromise = this.httpSemaphore.use(async () => {
-        try {
-          await this.minioClient.send(new HeadBucketCommand({ Bucket: this.bucket }));
-        } catch (error) {
-          const status = error?.$metadata?.httpStatusCode;
-          if (status !== 404 && error?.name !== "NotFound" && error?.name !== "NoSuchBucket") throw error;
-          await this.minioClient.send(new CreateBucketCommand({ Bucket: this.bucket }));
-        }
+      const pending = this.httpSemaphore.use(() => this.minioClient.ensureBucket({ signal }));
+      const checked = pending.catch((error) => {
+        if (this.bucketReadyPromise === checked) this.bucketReadyPromise = null;
+        throw error;
       });
+      this.bucketReadyPromise = checked;
     }
     return this.bucketReadyPromise;
   }
@@ -276,6 +302,12 @@ export class LifecycleTransferService {
 
   async kick() {
     if (this.stopped) return;
+    try {
+      await this.refreshEnvironment();
+    } catch (error) {
+      console.error(`[home-minio] lifecycle configuration refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     const available = Math.max(0, this.maxHttpConcurrency - this.activeItemIds.size);
     if (!available) return;
     const runnable = this.store.listRunnableItems(available * 2);
@@ -292,12 +324,14 @@ export class LifecycleTransferService {
         .finally(() => {
           this.activeItemIds.delete(candidate.id);
           this.activeObjectKeys.delete(candidate.objectKey);
+          this.applyPendingEnvironment();
           if (!this.stopped) queueMicrotask(() => void this.kick());
         });
     }
   }
 
   async submitJob(payload) {
+    await this.refreshEnvironment();
     const job = this.store.createJob(payload);
     if (!this.stopped) void this.kick();
     return job;
@@ -322,27 +356,17 @@ export class LifecycleTransferService {
     return job;
   }
 
-  async headHomeObject(objectKey) {
+  async headHomeObject(objectKey, signal) {
     return this.httpSemaphore.use(async () => {
-      try {
-        const result = await this.minioClient.send(new HeadObjectCommand({ Bucket: this.bucket, Key: objectKey }));
-        return {
-          sizeBytes: Number(result.ContentLength ?? 0),
-          etag: normalizeEtag(result.ETag),
-          sha256: result.Metadata?.sha256 || null,
-        };
-      } catch (error) {
-        const status = error?.$metadata?.httpStatusCode;
-        if (status === 404 || error?.name === "NotFound" || error?.name === "NoSuchKey") return null;
-        throw error;
-      }
+      const result = await this.minioClient.headObject(objectKey, { signal });
+      return result ? { ...result, etag: normalizeEtag(result.etag) } : null;
     });
   }
 
   async copySourceToHome(item, signal) {
     throwIfAborted(signal);
-    await this.ensureBucket();
-    const existing = await this.headHomeObject(item.objectKey);
+    await this.ensureBucket(signal);
+    const existing = await this.headHomeObject(item.objectKey, signal);
     if (existing) {
       const expectedHomeSize = item.expectedSizeBytes ?? item.home?.sizeBytes ?? null;
       const expectedHomeSha256 = item.expectedSha256 || item.home?.sha256 || null;
@@ -392,13 +416,11 @@ export class LifecycleTransferService {
         },
       });
       const body = nodeReadable(response.body).pipe(counter);
-      const upload = await this.minioClient.send(new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: item.objectKey,
-        Body: body,
-        ContentLength: contentLength,
-        ContentType: item.mimeType || response.headers.get("content-type") || "application/octet-stream",
-      }), { abortSignal: signal });
+      const upload = await this.minioClient.putObject(item.objectKey, body, {
+        contentLength,
+        contentType: item.mimeType || response.headers.get("content-type") || "application/octet-stream",
+        signal,
+      });
       if (copiedBytes !== contentLength) {
         throw new Error(`Home MinIO copy ended at ${copiedBytes} of ${contentLength} bytes.`);
       }
@@ -406,9 +428,9 @@ export class LifecycleTransferService {
       if (item.expectedSha256 && sha256 !== item.expectedSha256) {
         throw new PermanentLifecycleTransferError("Source SHA-256 does not match the expected checksum.");
       }
-      return { contentLength, uploadEtag: normalizeEtag(upload.ETag), sha256 };
+      return { contentLength, uploadEtag: normalizeEtag(upload.etag), sha256 };
     }, 2));
-    const verified = await this.headHomeObject(item.objectKey);
+    const verified = await this.headHomeObject(item.objectKey, signal);
     if (!verified || verified.sizeBytes !== copied.contentLength) {
       throw new Error("Home MinIO HEAD verification failed after upload.");
     }
@@ -418,12 +440,9 @@ export class LifecycleTransferService {
   async hashHomeObject(objectKey, signal) {
     return this.httpSemaphore.use(async () => {
       throwIfAborted(signal);
-      const response = await this.minioClient.send(
-        new GetObjectCommand({ Bucket: this.bucket, Key: objectKey }),
-        { abortSignal: signal },
-      );
+      const response = await this.minioClient.getObject(objectKey, { signal });
       const hash = createHash("sha256");
-      for await (const chunk of nodeReadable(response.Body)) {
+      for await (const chunk of nodeReadable(response.body)) {
         throwIfAborted(signal);
         hash.update(chunk);
       }
@@ -454,10 +473,7 @@ export class LifecycleTransferService {
     }
 
     return this.httpSemaphore.use(async () => {
-      const response = await this.minioClient.send(
-        new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }),
-        { abortSignal: signal },
-      );
+      const response = await this.minioClient.getObject(item.objectKey, { signal });
       const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
       const hash = createHash("sha256");
       let copiedBytes = 0;
@@ -469,7 +485,7 @@ export class LifecycleTransferService {
         },
       });
       try {
-        await pipeline(nodeReadable(response.Body), counter, createWriteStream(tempPath, { flags: "wx" }), { signal });
+        await pipeline(nodeReadable(response.body), counter, createWriteStream(tempPath, { flags: "wx" }), { signal });
         if (copiedBytes !== expectedSize) throw new Error(`Staged object size mismatch: ${copiedBytes} of ${expectedSize}.`);
         const sha256 = hash.digest("hex");
         if (expectedSha256 && sha256 !== expectedSha256) throw new Error("Staged object SHA-256 mismatch.");
@@ -585,13 +601,10 @@ export class LifecycleTransferService {
           } else {
             const result = await this.httpSemaphore.use(async () => {
               throwIfAborted(signal);
-              const response = await this.minioClient.send(
-                new GetObjectCommand({ Bucket: this.bucket, Key: item.objectKey }),
-                { abortSignal: signal },
-              );
-              return client.putStream(item.objectKey, this.meteredReadable(response.Body), {
+              const response = await this.minioClient.getObject(item.objectKey, { signal });
+              return client.putStream(item.objectKey, this.meteredReadable(response.body), {
                 contentLength: home.sizeBytes,
-                mime: item.mimeType || response.ContentType || "application/octet-stream",
+                mime: item.mimeType || response.contentType || "application/octet-stream",
                 meta: sha256 ? { sha256 } : undefined,
               });
             }, 2);
