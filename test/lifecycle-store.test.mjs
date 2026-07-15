@@ -599,6 +599,9 @@ test("cancelled streaming runs do not deliver callbacks until the same run is re
 
     assert.equal(store.listRunnableCallbacks().length, 0);
     assert.equal(store.getJob(run.id).items.find((item) => item.id === pendingItem.id).status, "CANCELLED");
+    const cancelledCallback = store.enqueueItemCallback(pendingItem.id);
+    assert.equal(cancelledCallback.payload.status, "CANCELLED");
+    store.markCallbacksDelivered([cancelledCallback.id]);
 
     const resumed = store.resumeStreamingJob(run.id);
     assert.equal(resumed.status, "RUNNING");
@@ -610,7 +613,11 @@ test("cancelled streaming runs do not deliver callbacks until the same run is re
       homeVerifiedAt: new Date().toISOString(),
       finishedAt: new Date().toISOString(),
     });
-    store.enqueueItemCallback(pendingItem.id);
+    const resumedCallback = store.enqueueItemCallback(pendingItem.id);
+    assert.equal(resumedCallback.id, cancelledCallback.id);
+    assert.equal(resumedCallback.sequence, cancelledCallback.sequence);
+    assert.equal(resumedCallback.status, "QUEUED");
+    assert.equal(resumedCallback.payload.status, "SUCCEEDED");
     assert.equal(store.listRunnableCallbacks().length, 2);
   });
 });

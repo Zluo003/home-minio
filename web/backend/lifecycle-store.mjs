@@ -1105,7 +1105,21 @@ export class LifecycleStore {
     const job = this.getJobControl(itemRow.job_id);
     if (!job?.callback_url || !job.callback_token) return null;
     const existing = this.db.prepare("SELECT * FROM callback_outbox WHERE run_id = ? AND item_id = ?").get(itemRow.job_id, itemId);
-    if (existing) return serializeCallback(existing);
+    if (existing) {
+      const previousPayload = parseJson(existing.payload_json, null);
+      if (previousPayload?.status === "CANCELLED" && itemRow.status !== "CANCELLED") {
+        const now = nowIso();
+        this.db.prepare(`
+          UPDATE callback_outbox
+          SET status = 'QUEUED', payload_json = ?, attempt_count = 0,
+              next_retry_at = NULL, delivered_at = NULL, error = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(JSON.stringify(serializeItem(itemRow)), now, existing.id);
+        this.refreshJob(itemRow.job_id);
+        return serializeCallback(this.db.prepare("SELECT * FROM callback_outbox WHERE id = ?").get(existing.id));
+      }
+      return serializeCallback(existing);
+    }
     const now = nowIso();
     let callbackId = "";
     this.db.transaction(() => {
