@@ -402,6 +402,10 @@ export class LifecycleTransferService {
     return this.store.getJobSummary(id);
   }
 
+  getJobSummaryWithDiagnostics(id) {
+    return this.store.getJobSummaryWithDiagnostics(id);
+  }
+
   kickManifestRuns() {
     if (this.stopped) return;
     for (const runId of this.store.listManifestRuns(4)) {

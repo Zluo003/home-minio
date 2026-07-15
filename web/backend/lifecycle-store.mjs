@@ -747,6 +747,11 @@ export class LifecycleStore {
     return job ? { ...job, ...this.getCallbackDeliverySummary(id) } : null;
   }
 
+  getJobSummaryWithDiagnostics(id) {
+    const job = this.getJobSummary(id);
+    return job ? { ...job, diagnostics: this.getJobDiagnostics(id) } : null;
+  }
+
   getCallbackDeliverySummary(runId) {
     const row = this.db.prepare(`
       SELECT
@@ -969,6 +974,12 @@ export class LifecycleStore {
       WHERE job_id = ?
       GROUP BY stage
     `).all(id);
+    const targetStageRows = this.db.prepare(`
+      SELECT target_tier, stage, COUNT(*) AS count
+      FROM transfer_items
+      WHERE job_id = ?
+      GROUP BY target_tier, stage
+    `).all(id);
     const retry = this.db.prepare(`
       SELECT MIN(next_retry_at) AS next_retry_at
       FROM transfer_items
@@ -982,11 +993,41 @@ export class LifecycleStore {
       ORDER BY count DESC, error
       LIMIT 5
     `).all(id);
+    const failedItemCount = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM transfer_items
+      WHERE job_id = ? AND status = 'FAILED'
+    `).get(id)?.count || 0);
+    const failedItems = this.db.prepare(`
+      SELECT object_key, target_tier, status, stage, attempt_count,
+             expected_size_bytes, error, updated_at
+      FROM transfer_items
+      WHERE job_id = ? AND status = 'FAILED'
+      ORDER BY updated_at DESC, object_key
+      LIMIT 100
+    `).all(id).map((row) => ({
+      objectKey: row.object_key,
+      targetTier: row.target_tier,
+      status: row.status,
+      stage: row.stage,
+      attemptCount: Number(row.attempt_count || 0),
+      expectedSizeBytes: row.expected_size_bytes == null ? null : Number(row.expected_size_bytes),
+      error: row.error || null,
+      updatedAt: row.updated_at,
+    }));
+    const targetStageCounts = {};
+    for (const row of targetStageRows) {
+      targetStageCounts[row.target_tier] ||= {};
+      targetStageCounts[row.target_tier][row.stage] = row.count;
+    }
     return {
       statusCounts: Object.fromEntries(statusRows.map((row) => [row.status, row.count])),
       stageCounts: Object.fromEntries(stageRows.map((row) => [row.stage, row.count])),
+      targetStageCounts,
       nextRetryAt: retry?.next_retry_at || null,
       errorSamples: errorRows.map((row) => ({ message: row.error, count: row.count })),
+      failedItemCount,
+      failedItems,
     };
   }
 

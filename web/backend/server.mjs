@@ -654,7 +654,7 @@ async function handle(request, reply) {
   if (request.method === "GET" && url.pathname.startsWith("/api/v2/lifecycle/runs/")) {
     assertLifecycleReady();
     const runId = decodeURIComponent(url.pathname.slice("/api/v2/lifecycle/runs/".length));
-    const run = lifecycleService.getJobSummary(runId);
+    const run = lifecycleService.getJobSummaryWithDiagnostics(runId);
     if (!run) return send(reply, 404, { message: "lifecycle run not found" });
     return send(reply, 200, { run, runId });
   }

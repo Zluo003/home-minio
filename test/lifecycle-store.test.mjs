@@ -670,6 +670,57 @@ test("cancelled lifecycle jobs retain completed items and resume unfinished item
   });
 });
 
+test("job summaries expose transfer stages and failed file diagnostics", async () => {
+  await withStore(({ store }) => {
+    const version = store.upsertConfigVersion(ossConfig);
+    const job = store.createJob({
+      id: "run-stage-diagnostics",
+      mediaKind: "GENERATED_MEDIA",
+      configVersionId: version.id,
+      items: [
+        {
+          lifecycleObjectId: "object-complete",
+          objectKey: "gateway-media/2026/07/complete.png",
+          sourceUrl: "https://api.example.test/local-media/gateway-media/2026/07/complete.png",
+          targetTier: "WARM_OSS",
+          expectedSizeBytes: 12,
+        },
+        {
+          lifecycleObjectId: "object-failed",
+          objectKey: "gateway-media/2026/07/failed.png",
+          sourceUrl: "https://api.example.test/local-media/gateway-media/2026/07/failed.png",
+          targetTier: "WARM_OSS",
+          expectedSizeBytes: 18,
+        },
+      ],
+    });
+    const completeItem = job.items.find((item) => item.objectKey.endsWith("/complete.png"));
+    const failedItem = job.items.find((item) => item.objectKey.endsWith("/failed.png"));
+    store.updateItem(completeItem.id, { status: "SUCCEEDED", stage: "COMPLETED" });
+    store.updateItem(failedItem.id, {
+      status: "FAILED",
+      stage: "FAILED",
+      error: "Source download failed with HTTP 404.",
+    });
+
+    const summary = store.getJobSummaryWithDiagnostics(job.id);
+    assert.deepEqual(summary.diagnostics.stageCounts, { COMPLETED: 1, FAILED: 1 });
+    assert.deepEqual(summary.diagnostics.targetStageCounts, {
+      WARM_OSS: { COMPLETED: 1, FAILED: 1 },
+    });
+    assert.equal(summary.diagnostics.failedItemCount, 1);
+    assert.deepEqual(summary.diagnostics.failedItems.map((item) => ({
+      objectKey: item.objectKey,
+      stage: item.stage,
+      error: item.error,
+    })), [{
+      objectKey: "gateway-media/2026/07/failed.png",
+      stage: "FAILED",
+      error: "Source download failed with HTTP 404.",
+    }]);
+  });
+});
+
 test("RUNNING jobs and items recover to retryable state after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "home-minio-recovery-"));
   const dbPath = join(root, "state.sqlite");
