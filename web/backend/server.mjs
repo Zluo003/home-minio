@@ -638,14 +638,16 @@ async function handle(request, reply) {
     return send(reply, 202, { run, runId: run.id });
   }
 
-  const lifecycleV2ActionMatch = /^\/api\/v2\/lifecycle\/runs\/([^/]+)\/(cancel|resume)$/.exec(url.pathname);
+  const lifecycleV2ActionMatch = /^\/api\/v2\/lifecycle\/runs\/([^/]+)\/(cancel|resume|replay-callbacks)$/.exec(url.pathname);
   if (request.method === "POST" && lifecycleV2ActionMatch) {
     assertLifecycleReady();
     const runId = decodeURIComponent(lifecycleV2ActionMatch[1]);
     const action = lifecycleV2ActionMatch[2];
     const changed = action === "cancel"
       ? lifecycleService.cancelStreamingJob(runId)
-      : lifecycleService.resumeStreamingJob(runId);
+      : action === "resume"
+        ? lifecycleService.resumeStreamingJob(runId)
+        : lifecycleService.replayStreamingJobCallbacks(runId);
     if (!changed) return send(reply, 404, { message: "lifecycle run not found" });
     const run = lifecycleService.getJobSummary(runId);
     return send(reply, 200, { run, runId });

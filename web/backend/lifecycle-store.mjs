@@ -1295,6 +1295,55 @@ export class LifecycleStore {
     return this.getJobSummary(id);
   }
 
+  replayStreamingJobCallbacks(id) {
+    const job = this.getJobControl(id);
+    if (!job) return null;
+    if (job.manifest_status !== "SEALED") {
+      throw new LifecycleConflictError("Lifecycle callback replay requires a sealed manifest.");
+    }
+    if (!job.callback_url || !job.callback_token) {
+      throw new LifecycleConflictError("Lifecycle callback replay requires a persisted NewWaule callback target.");
+    }
+    const counts = this.db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM transfer_items WHERE job_id = ?) AS item_count,
+        (SELECT COUNT(*) FROM transfer_items
+          WHERE job_id = ? AND status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')) AS active_item_count,
+        (SELECT COUNT(*) FROM callback_outbox WHERE run_id = ?) AS callback_count,
+        (SELECT COUNT(*) FROM callback_outbox
+          WHERE run_id = ? AND status IN ('QUEUED', 'SENDING', 'RETRY_WAIT')) AS pending_callback_count,
+        (SELECT COUNT(*) FROM callback_outbox WHERE run_id = ? AND status = 'SENDING') AS sending_callback_count
+    `).get(id, id, id, id, id);
+    if (!counts.item_count || counts.callback_count !== counts.item_count) {
+      throw new LifecycleConflictError("Lifecycle callback replay requires one persisted result for every transfer item.");
+    }
+    if (counts.active_item_count > 0) {
+      throw new LifecycleConflictError("Lifecycle callback replay cannot run while file transfers are active.");
+    }
+    if (counts.sending_callback_count > 0) {
+      throw new LifecycleConflictError("Lifecycle callback replay cannot reset callbacks that are currently being sent.");
+    }
+    // An already queued replay is returned unchanged so retries cannot restart
+    // file transfers or continuously reset callback attempt state.
+    if (counts.pending_callback_count > 0) return this.getJobSummary(id);
+
+    const replayedAt = nowIso();
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE callback_outbox
+        SET status = 'QUEUED', attempt_count = 0, next_retry_at = NULL,
+            error = NULL, delivered_at = NULL, updated_at = ?
+        WHERE run_id = ?
+      `).run(replayedAt, id);
+      this.db.prepare(`
+        UPDATE transfer_jobs
+        SET status = 'RESULTS_PENDING', error = NULL, finished_at = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(replayedAt, id);
+    })();
+    return this.getJobSummary(id);
+  }
+
   resumeJob(id) {
     const job = this.db.prepare("SELECT status FROM transfer_jobs WHERE id = ?").get(id);
     if (!job) return null;

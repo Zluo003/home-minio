@@ -553,6 +553,12 @@ export class LifecycleTransferService {
     return job;
   }
 
+  replayStreamingJobCallbacks(id) {
+    const job = this.store.replayStreamingJobCallbacks(id);
+    if (job && !this.stopped) this.kickCallbacks();
+    return job;
+  }
+
   async headHomeObject(objectKey, signal) {
     return this.httpSemaphore.use(async () => {
       const result = await this.minioClient.headObject(objectKey, { signal });

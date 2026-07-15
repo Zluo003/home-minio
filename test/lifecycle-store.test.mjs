@@ -225,6 +225,69 @@ test("large callback outboxes select one runnable batch without scanning every i
   });
 });
 
+test("completed streaming callbacks can be replayed without rerunning transfer items", async () => {
+  await withStore(({ store }) => {
+    const configVersion = store.upsertConfigVersion(ossConfig);
+    const run = store.createStreamingJob({
+      id: "callback-replay-run",
+      mediaKind: "GENERATED_MEDIA",
+      configVersionId: configVersion.id,
+      expectedCount: 2,
+      manifestUrl: "https://api.example.test/internal/callback-replay-run/manifest",
+      manifestToken: "manifest-token",
+      callbackUrl: "https://api.example.test/internal/callback-replay-run/results",
+      callbackToken: "callback-token",
+    });
+    store.claimManifestRun(run.id);
+    store.appendManifestItems(run.id, [1, 2].map((sequence) => ({
+      lifecycleObjectId: `callback-replay-object-${sequence}`,
+      objectKey: `gateway-media/callback-replay/${sequence}.png`,
+      sourceUrl: `https://api.example.test/local-media/gateway-media/callback-replay/${sequence}.png`,
+      targetTier: "WARM_OSS",
+      expectedSizeBytes: sequence * 10,
+      mimeType: "image/png",
+    })));
+    store.completeManifest(run.id);
+
+    const completedAt = new Date().toISOString();
+    const items = store.getJob(run.id).items;
+    for (const item of items) {
+      store.updateItem(item.id, {
+        status: "SUCCEEDED",
+        stage: "COMPLETED",
+        homeSizeBytes: item.expectedSizeBytes,
+        homeVerifiedAt: completedAt,
+        ossSizeBytes: item.expectedSizeBytes,
+        ossVerifiedAt: completedAt,
+        finishedAt: completedAt,
+      });
+      store.enqueueItemCallback(item.id);
+    }
+    const original = store.db.prepare(`
+      SELECT id, item_id, sequence, payload_json FROM callback_outbox
+      WHERE run_id = ? ORDER BY sequence
+    `).all(run.id);
+    const claimed = store.claimCallbacks(original.map((callback) => callback.id));
+    store.markCallbacksDelivered(claimed.map((callback) => callback.id));
+    assert.equal(store.getJobSummary(run.id).status, "SUCCEEDED");
+
+    const replayed = store.replayStreamingJobCallbacks(run.id);
+    assert.equal(replayed.status, "RESULTS_PENDING");
+    assert.equal(replayed.callbackPendingCount, 2);
+    assert.equal(replayed.callbackDeliveredCount, 0);
+    assert.deepEqual(
+      store.db.prepare(`SELECT id, item_id, sequence, payload_json FROM callback_outbox WHERE run_id = ? ORDER BY sequence`).all(run.id),
+      original,
+    );
+    assert.deepEqual(store.getJob(run.id).items.map((item) => item.status), ["SUCCEEDED", "SUCCEEDED"]);
+    assert.equal(store.listRunnableItems().length, 0);
+
+    const idempotent = store.replayStreamingJobCallbacks(run.id);
+    assert.equal(idempotent.callbackPendingCount, 2);
+    assert.deepEqual(store.listRunnableCallbacks().map((callback) => callback.sequence), [1, 2]);
+  });
+});
+
 test("a cancelled partial manifest resumes every already-ingested item", async () => {
   await withStore(({ store }) => {
     const run = store.createStreamingJob({
