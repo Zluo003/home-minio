@@ -2,7 +2,7 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-RUN apk add --no-cache bash build-base ca-certificates curl docker-cli python3 py3-pip unzip
+RUN apk add --no-cache bash build-base ca-certificates curl docker-cli python3 py3-pip unzip util-linux
 
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev

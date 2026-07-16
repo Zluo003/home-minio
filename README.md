@@ -293,16 +293,18 @@ BAIDUPCS_UPLOAD_NORAPID=true
 Run a dry check first:
 
 ```bash
-./scripts/backup-to-baidupan.sh --dry-run
+docker compose exec web-api ./scripts/backup-to-baidupan.sh --dry-run
 ```
 
 Run the real backup:
 
 ```bash
-./scripts/backup-to-baidupan.sh
+docker compose exec web-api ./scripts/backup-to-baidupan.sh
 ```
 
-The script first mirrors MinIO objects to `backup/mirror/<bucket>/`, then uploads new or changed files to Baidu Netdisk. It records uploaded file signatures in `backup/state/baidupan-uploaded.tsv`, so repeated runs skip unchanged files and do not delete anything from Baidu Netdisk.
+The script first mirrors MinIO objects to `backup/mirror/<bucket>/`, then creates an incremental JSONL manifest containing only new, changed, or previously failed files. Baidu Netdisk upload strictly consumes that manifest. Runs, objects, per-file results, and retry state are transactionally persisted in the existing `HOME_MINIO_STATE_DB` SQLite database. The legacy `backup/state/baidupan-uploaded.tsv` is read only once during upgrade to import prior successful uploads.
+
+The first run after upgrading performs one full local mirror reconciliation to establish its database baseline. Later runs no longer walk every mirrored file or print one `SKIP` line per completed object: `mc mirror` reports only objects actually copied or changed, and those changes are merged with unfinished database records. MinIO still has to list bucket metadata to detect changes, but unchanged object bodies are not downloaded or sent to Baidu Netdisk.
 
 Automatic backup is handled by the `backup-scheduler` compose service. It reads `BAIDUPAN_CRON_SCHEDULE`; the current format supports daily schedules such as `35 3 * * *`.
 

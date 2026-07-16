@@ -23,6 +23,7 @@ BAIDUPCS_BIN="${BAIDUPCS_BIN:-BaiduPCS-Go}"
 BAIDUPCS_MAX_PARALLEL="${BAIDUPCS_MAX_PARALLEL:-16}"
 BAIDUPCS_UPLOAD_NORAPID="${BAIDUPCS_UPLOAD_NORAPID:-true}"
 MC_IMAGE="${MC_IMAGE:-quay.io/minio/mc:latest}"
+HOME_MINIO_STATE_DB="${HOME_MINIO_STATE_DB:-./state/home-minio.sqlite}"
 DRY_RUN=false
 SKIP_MIRROR=false
 
@@ -71,14 +72,30 @@ MIRROR_DIR="$WORK_DIR/mirror/$MINIO_BUCKET"
 STATE_DIR="$WORK_DIR/state"
 LOG_DIR="$WORK_DIR/logs"
 STATE_FILE="$STATE_DIR/baidupan-uploaded.tsv"
-RUN_MANIFEST="$STATE_DIR/manifest-$(date +%Y%m%d-%H%M%S).tsv"
+MIRROR_REPORT="$STATE_DIR/baidupan-mirror-changes.jsonl"
+MIRROR_REPORT_NEXT="$STATE_DIR/baidupan-mirror-changes.next.jsonl"
+RUN_ID="baidupan-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_MANIFEST="$STATE_DIR/manifest-$RUN_ID.jsonl"
+LOCK_FILE="$STATE_DIR/baidupan-backup.lock"
 
 mkdir -p "$MIRROR_DIR" "$STATE_DIR" "$LOG_DIR"
 touch "$STATE_FILE"
 
+if ! command -v flock >/dev/null; then
+  echo "flock is required for safe backup locking." >&2
+  exit 1
+fi
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Another Baidu Netdisk backup is already running." >&2
+  exit 1
+fi
+trap 'rm -f "$MIRROR_REPORT_NEXT" "$MIRROR_REPORT_NEXT.merged"' EXIT
+
 mirror_minio_bucket() {
   echo "Mirroring MinIO bucket $MINIO_BUCKET to $MIRROR_DIR"
-  docker run --rm \
+  rm -f "$MIRROR_REPORT_NEXT"
+  if ! docker run --rm \
     --network "container:home-minio" \
     -v "$WORK_DIR:/backup" \
     -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
@@ -89,47 +106,19 @@ mirror_minio_bucket() {
     -eu -c '
       mc alias set home http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
       mc mb --ignore-existing "home/$MINIO_BUCKET" >/dev/null
-      mc mirror --overwrite --preserve "home/$MINIO_BUCKET" "/backup/mirror/$MINIO_BUCKET"
-    '
-}
-
-remote_path_for_file() {
-  local relative="$1"
-  if [[ "$BAIDUPAN_TOOL" == "baidupcs" ]]; then
-    printf "/%s/%s/%s" "${BAIDUPAN_REMOTE_DIR#/}" "$MINIO_BUCKET" "$relative"
-  else
-    printf "%s/%s/%s" "${BAIDUPAN_REMOTE_DIR%/}" "$MINIO_BUCKET" "$relative"
+      mc mirror --json --overwrite --preserve "home/$MINIO_BUCKET" "/backup/mirror/$MINIO_BUCKET"
+    ' >"$MIRROR_REPORT_NEXT"; then
+    echo "MinIO mirror failed; no backup manifest was created." >&2
+    return 1
   fi
-}
 
-file_signature() {
-  local file="$1"
-  if stat -f "%z	%m" "$file" >/dev/null 2>&1; then
-    stat -f "%z	%m" "$file"
+  if [[ -s "$MIRROR_REPORT" ]]; then
+    cat "$MIRROR_REPORT" "$MIRROR_REPORT_NEXT" >"$MIRROR_REPORT_NEXT.merged"
+    mv "$MIRROR_REPORT_NEXT.merged" "$MIRROR_REPORT"
+    rm -f "$MIRROR_REPORT_NEXT"
   else
-    stat -c "%s	%Y" "$file"
+    mv "$MIRROR_REPORT_NEXT" "$MIRROR_REPORT"
   fi
-}
-
-is_uploaded() {
-  local relative="$1"
-  local size="$2"
-  local mtime="$3"
-  grep -Fqx "$MINIO_BUCKET	$relative	$size	$mtime" "$STATE_FILE"
-}
-
-mark_uploaded() {
-  local relative="$1"
-  local size="$2"
-  local mtime="$3"
-  printf "%s\t%s\t%s\t%s\n" "$MINIO_BUCKET" "$relative" "$size" "$mtime" >>"$STATE_FILE"
-}
-
-remote_dirname() {
-  local remote="$1"
-  local dir="${remote%/*}"
-  [[ "$dir" == "$remote" ]] && dir="/"
-  printf "%s" "$dir"
 }
 
 ensure_baidupcs_ready() {
@@ -137,62 +126,6 @@ ensure_baidupcs_ready() {
   "$BAIDUPCS_BIN" quota >/dev/null
   "$BAIDUPCS_BIN" config set -max_parallel "$BAIDUPCS_MAX_PARALLEL" >/dev/null || true
 }
-
-upload_with_baidupcs() {
-  local file="$1"
-  local remote="$2"
-  local remote_dir
-  local upload_args=()
-  remote_dir="$(remote_dirname "$remote")"
-  "$BAIDUPCS_BIN" mkdir "$remote_dir" >/dev/null 2>&1 || true
-  if [[ "$BAIDUPCS_UPLOAD_NORAPID" == "true" ]]; then
-    upload_args+=(--norapid)
-  fi
-  if [[ "$BAIDUPCS_MAX_PARALLEL" =~ ^[0-9]+$ ]] && [[ "$BAIDUPCS_MAX_PARALLEL" -gt 0 ]]; then
-    upload_args+=(-p "$BAIDUPCS_MAX_PARALLEL")
-  fi
-  "$BAIDUPCS_BIN" upload "$file" "$remote_dir" --policy rsync "${upload_args[@]}"
-}
-
-upload_with_bypy() {
-  local file="$1"
-  local remote="$2"
-  "$BYPY_BIN" upload "$file" "$remote"
-}
-
-upload_file() {
-  local file="$1"
-  local relative="${file#$MIRROR_DIR/}"
-  local signature
-  signature="$(file_signature "$file")"
-  local size="${signature%%	*}"
-  local mtime="${signature#*	}"
-
-  printf "%s\t%s\t%s\t%s\n" "$MINIO_BUCKET" "$relative" "$size" "$mtime" >>"$RUN_MANIFEST"
-
-  if is_uploaded "$relative" "$size" "$mtime"; then
-    echo "SKIP $relative"
-    return
-  fi
-
-  local remote
-  remote="$(remote_path_for_file "$relative")"
-  echo "$($DRY_RUN && echo DRY || echo UPLOAD) $relative -> $remote"
-  if [[ "$DRY_RUN" == "true" ]]; then
-    return
-  fi
-
-  if [[ "$BAIDUPAN_TOOL" == "baidupcs" ]]; then
-    upload_with_baidupcs "$file" "$remote"
-  else
-    upload_with_bypy "$file" "$remote"
-  fi
-  mark_uploaded "$relative" "$size" "$mtime"
-}
-
-if [[ "$DRY_RUN" != "true" && "$BAIDUPAN_TOOL" == "baidupcs" ]]; then
-  ensure_baidupcs_ready
-fi
 
 if [[ "$SKIP_MIRROR" != "true" ]]; then
   mirror_minio_bucket
@@ -203,9 +136,46 @@ if [[ ! -d "$MIRROR_DIR" ]]; then
   exit 1
 fi
 
-while IFS= read -r -d '' file; do
-  upload_file "$file"
-done < <(find "$MIRROR_DIR" -type f ! -name ".DS_Store" -print0 | sort -z)
+manifest_args=(
+  --run-id "$RUN_ID"
+  --bucket "$MINIO_BUCKET"
+  --mirror-dir "$MIRROR_DIR"
+  --uploaded-state "$STATE_FILE"
+  --manifest "$RUN_MANIFEST"
+  --db "$HOME_MINIO_STATE_DB"
+)
+if [[ -s "$MIRROR_REPORT" ]]; then
+  manifest_args+=(--mirror-report "$MIRROR_REPORT")
+fi
+if [[ "$DRY_RUN" == "true" ]]; then
+  manifest_args+=(--dry-run)
+fi
+node ./scripts/build-baidupan-backup-manifest.mjs "${manifest_args[@]}"
+rm -f "$MIRROR_REPORT"
+
+if [[ "$DRY_RUN" != "true" && "$BAIDUPAN_TOOL" == "baidupcs" ]]; then
+  ensure_baidupcs_ready
+fi
+
+runner_args=(
+  --run-id "$RUN_ID"
+  --mirror-dir "$MIRROR_DIR"
+  --db "$HOME_MINIO_STATE_DB"
+  --tool "$BAIDUPAN_TOOL"
+  --remote-dir "$BAIDUPAN_REMOTE_DIR"
+  --baidupcs-bin "$BAIDUPCS_BIN"
+  --bypy-bin "$BYPY_BIN"
+  --max-parallel "$BAIDUPCS_MAX_PARALLEL"
+)
+if [[ "$BAIDUPCS_UPLOAD_NORAPID" == "true" ]]; then
+  runner_args+=(--no-rapid)
+fi
+if [[ "$DRY_RUN" == "true" ]]; then
+  runner_args+=(--dry-run)
+fi
 
 echo "Manifest: $RUN_MANIFEST"
-echo "Done."
+if ! node ./scripts/run-baidupan-backup-manifest.mjs "${runner_args[@]}"; then
+  echo "Backup run $RUN_ID completed with errors; failed items remain queued in SQLite." >&2
+  exit 1
+fi

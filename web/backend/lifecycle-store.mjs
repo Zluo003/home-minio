@@ -2,8 +2,12 @@ import { createDecipheriv, createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
+import {
+  BAIDUPAN_BACKUP_SCHEMA_VERSION,
+  migrateBaidupanBackupSchema,
+} from "./baidupan-backup-store.mjs";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = BAIDUPAN_BACKUP_SCHEMA_VERSION;
 const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "SUCCEEDED_WITH_ERRORS", "FAILED", "CANCELLED"]);
 const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
@@ -571,6 +575,10 @@ export class LifecycleStore {
         `);
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(5, nowIso());
       })();
+      current = 5;
+    }
+    if (current < BAIDUPAN_BACKUP_SCHEMA_VERSION) {
+      migrateBaidupanBackupSchema(this.db);
     }
   }
 
