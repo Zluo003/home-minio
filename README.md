@@ -280,7 +280,9 @@ BAIDUPAN_BACKUP_ENABLED=true
 BAIDUPAN_TOOL=baidupcs
 BAIDUPAN_REMOTE_DIR=NewWaule/home-minio
 BAIDUPAN_WORK_DIR=./backup
-BAIDUPAN_CRON_SCHEDULE=35 3 * * *
+BAIDUPAN_BACKUP_FREQUENCY=daily
+BAIDUPAN_BACKUP_TIME=03:35
+BAIDUPAN_TIME_ZONE=Asia/Shanghai
 BYPY_BIN=bypy
 BAIDUPCS_BIN=BaiduPCS-Go
 BAIDUPCS_CONFIG_DIR=/root/.config/BaiduPCS-Go
@@ -306,7 +308,7 @@ The script first mirrors MinIO objects to `backup/mirror/<bucket>/`, then create
 
 The first run after upgrading performs one full local mirror reconciliation to establish its database baseline. Later runs no longer walk every mirrored file or print one `SKIP` line per completed object: `mc mirror` reports only objects actually copied or changed, and those changes are merged with unfinished database records. MinIO still has to list bucket metadata to detect changes, but unchanged object bodies are not downloaded or sent to Baidu Netdisk.
 
-Automatic backup is handled by the `backup-scheduler` compose service. It reads `BAIDUPAN_CRON_SCHEDULE`; the current format supports daily schedules such as `35 3 * * *`.
+Automatic backup is handled by the `backup-scheduler` compose service. Configure its frequency, time, and time zone from the `备份与恢复` page. Existing `BAIDUPAN_CRON_SCHEDULE` values are still read as a legacy fallback, but the Cron expression is no longer exposed in the console.
 
 ```bash
 docker compose up -d --force-recreate backup-scheduler

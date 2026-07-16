@@ -69,19 +69,31 @@ function renderField(field) {
   let control = "";
 
   if (field.type === "select") {
-    control = `<select id="${fieldId}" name="${field.key}">${(field.options || []).map(([optionValue, label]) => (
+    const options = [...(field.options || [])];
+    if (value && !options.some(([optionValue]) => String(optionValue) === String(value))) {
+      options.unshift([String(value), String(value)]);
+    }
+    control = `<select id="${fieldId}" name="${field.key}">${options.map(([optionValue, label]) => (
       `<option value="${escapeHtml(optionValue)}" ${String(value) === String(optionValue) ? "selected" : ""}>${escapeHtml(label)}</option>`
     )).join("")}</select>`;
   } else {
-    const inputType = field.type === "password" ? "password" : field.type === "number" ? "number" : "text";
+    const inputType = field.type === "password"
+      ? "password"
+      : field.type === "number"
+        ? "number"
+        : field.type === "time"
+          ? "time"
+          : "text";
     const placeholder = field.type === "password" && configured
       ? "已配置，留空不修改"
       : field.placeholder || "";
     const inputValue = field.type === "password" ? "" : value;
-    const numericAttributes = inputType === "number"
+    const inputAttributes = inputType === "number"
       ? `${field.min !== undefined ? ` min="${field.min}"` : ""}${field.max !== undefined ? ` max="${field.max}"` : ""}${field.step !== undefined ? ` step="${field.step}"` : ""}`
-      : "";
-    control = `<input id="${fieldId}" type="${inputType}" name="${field.key}" value="${escapeHtml(inputValue)}" placeholder="${escapeHtml(placeholder)}"${numericAttributes}${inputType === "password" ? ' autocomplete="new-password"' : ""} />`;
+      : inputType === "time"
+        ? ' step="60"'
+        : "";
+    control = `<input id="${fieldId}" type="${inputType}" name="${field.key}" value="${escapeHtml(inputValue)}" placeholder="${escapeHtml(placeholder)}"${inputAttributes}${inputType === "password" ? ' autocomplete="new-password"' : ""} />`;
   }
 
   return `
@@ -243,7 +255,7 @@ async function loadStatus() {
   document.getElementById("baidupanState").textContent = status.baidupan.enabled ? status.baidupan.remoteDir : "未启用";
   document.getElementById("toolState").textContent = status.cachePush?.latestJob
     ? `push ${status.cachePush.latestJob.status} · ${status.cachePush.concurrency}`
-    : `${status.baidupan.tool} · ${status.baidupan.cronSchedule}`;
+    : `${status.baidupan.tool} · ${status.baidupan.scheduleLabel}`;
   document.getElementById("lifecycleState").textContent = status.lifecycle?.ready
     ? `${status.lifecycle.activeItems} 处理中 · ${status.lifecycle.jobs} 批次`
     : status.lifecycle?.startupError || "未就绪";

@@ -14,6 +14,11 @@ import {
 } from "./home-minio-token.mjs";
 import { LifecycleStore } from "./lifecycle-store.mjs";
 import { LifecycleTransferService } from "./lifecycle-service.mjs";
+import {
+  describeBackupSchedule,
+  normalizeBackupSchedule,
+  validateBackupScheduleValues,
+} from "./backup-schedule.mjs";
 import { CONFIG_FIELDS, SECRET_CONFIG_KEYS } from "../frontend/config-schema.js";
 
 const rootDir = resolve(new URL("../..", import.meta.url).pathname);
@@ -545,8 +550,14 @@ async function handle(request, reply) {
 
   if (request.method === "GET" && url.pathname === "/api/config") {
     const { values } = await readEnv();
+    const backupSchedule = normalizeBackupSchedule(values);
     return send(reply, 200, {
-      values: sanitizeEditableValues(values),
+      values: sanitizeEditableValues({
+        ...values,
+        BAIDUPAN_BACKUP_FREQUENCY: backupSchedule.frequency,
+        BAIDUPAN_BACKUP_TIME: backupSchedule.time,
+        BAIDUPAN_TIME_ZONE: backupSchedule.timeZone,
+      }),
       configuredKeys: [...secretEditableKeys].filter((key) => Boolean(values[key])),
       editableKeys,
     });
@@ -564,11 +575,23 @@ async function handle(request, reply) {
           : nextValue;
       }
     }
+    try {
+      validateBackupScheduleValues(sanitized);
+    } catch (error) {
+      error.statusCode = 400;
+      throw error;
+    }
     const values = await saveEnv(synchronizeHomeMinioTokenValues(sanitized));
     acceptedAuthTokens = new Set(collectHomeMinioAuthTokens({ ...process.env, ...values }));
     lifecycleService?.reconfigure({ ...process.env, ...values });
+    const backupSchedule = normalizeBackupSchedule(values);
     return send(reply, 200, {
-      values: sanitizeEditableValues(values),
+      values: sanitizeEditableValues({
+        ...values,
+        BAIDUPAN_BACKUP_FREQUENCY: backupSchedule.frequency,
+        BAIDUPAN_BACKUP_TIME: backupSchedule.time,
+        BAIDUPAN_TIME_ZONE: backupSchedule.timeZone,
+      }),
       configuredKeys: [...secretEditableKeys].filter((key) => Boolean(values[key])),
       message: "saved",
     });
@@ -576,6 +599,7 @@ async function handle(request, reply) {
 
   if (request.method === "GET" && url.pathname === "/api/status") {
     const { values } = await readEnv();
+    const backupSchedule = normalizeBackupSchedule(values);
     const lifecycleHealth = lifecycleStore.health();
     return send(reply, 200, {
       minio: await minioReady(values),
@@ -610,7 +634,10 @@ async function handle(request, reply) {
         enabled: values.BAIDUPAN_BACKUP_ENABLED === "true",
         tool: values.BAIDUPAN_TOOL || "baidupcs",
         remoteDir: values.BAIDUPAN_REMOTE_DIR || "/NewWaule/home-minio",
-        cronSchedule: values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *",
+        frequency: backupSchedule.frequency,
+        time: backupSchedule.time,
+        timeZone: backupSchedule.timeZone,
+        scheduleLabel: describeBackupSchedule(backupSchedule),
       },
       pullJob: latestPullJobId && pullJobs.has(latestPullJobId) ? serializePullJob(pullJobs.get(latestPullJobId)) : null,
       lifecycle: {
@@ -828,19 +855,20 @@ async function handle(request, reply) {
 
   if (request.method === "POST" && url.pathname === "/api/actions/install-cron") {
     const { values } = await readEnv();
-    const schedule = values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *";
+    const schedule = describeBackupSchedule(normalizeBackupSchedule(values));
     return send(reply, 200, {
       code: 0,
-      stdout: `自动备份计划已保存为：${schedule}\nDocker 调度服务 home-minio-backup-scheduler 会按该时间运行。\n如果刚修改了时间，请执行 docker compose up -d --force-recreate backup-scheduler 让调度容器读取新配置。`,
+      stdout: `当前自动备份计划：${schedule}\nDocker 调度服务 home-minio-backup-scheduler 会按该计划运行。\n如果刚修改了计划，请执行 docker compose up -d --force-recreate backup-scheduler 让调度容器读取新配置。`,
       stderr: "",
     });
   }
 
   if (request.method === "GET" && url.pathname === "/api/cron") {
     const { values } = await readEnv();
+    const schedule = normalizeBackupSchedule(values);
     return send(reply, 200, {
       code: 0,
-      stdout: `BAIDUPAN_BACKUP_ENABLED=${values.BAIDUPAN_BACKUP_ENABLED || "false"}\nBAIDUPAN_CRON_SCHEDULE=${values.BAIDUPAN_CRON_SCHEDULE || "35 3 * * *"}\nservice=home-minio-backup-scheduler`,
+      stdout: `启用：${values.BAIDUPAN_BACKUP_ENABLED === "true" ? "是" : "否"}\n频率：${describeBackupSchedule(schedule)}\n服务：home-minio-backup-scheduler`,
       stderr: "",
     });
   }

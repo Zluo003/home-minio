@@ -8,20 +8,21 @@ if [[ ! -f .env ]]; then
   echo ".env not found. Scheduler waiting."
 fi
 
-parse_daily_time() {
+legacy_schedule_values() {
   local schedule="${BAIDUPAN_CRON_SCHEDULE:-35 3 * * *}"
-  local minute hour rest
-  read -r minute hour rest <<<"$schedule"
+  local minute hour day_of_month month day_of_week
+  read -r minute hour day_of_month month day_of_week <<<"$schedule"
   if [[ "$minute" =~ ^[0-9]{1,2}$ && "$hour" =~ ^[0-9]{1,2}$ && "$minute" -ge 0 && "$minute" -le 59 && "$hour" -ge 0 && "$hour" -le 23 ]]; then
-    printf "%02d:%02d" "$hour" "$minute"
-    return
+    LEGACY_BACKUP_TIME="$(printf "%02d:%02d" "$hour" "$minute")"
+  else
+    LEGACY_BACKUP_TIME="03:35"
   fi
-  echo "03:35"
-}
-
-seconds_until_next_run() {
-  local hhmm="$1"
-  node ./scripts/next-daily-run-delay.mjs "$hhmm"
+  if [[ "$day_of_month" == "*" && "$month" == "*" && "$day_of_week" =~ ^[0-7]$ ]]; then
+    [[ "$day_of_week" == "7" ]] && day_of_week="0"
+    LEGACY_BACKUP_FREQUENCY="weekly:$day_of_week"
+  else
+    LEGACY_BACKUP_FREQUENCY="daily"
+  fi
 }
 
 while true; do
@@ -29,9 +30,12 @@ while true; do
   source .env 2>/dev/null || true
   set +a
 
-  run_time="$(parse_daily_time)"
-  wait_seconds="$(seconds_until_next_run "$run_time")"
-  echo "Next Baidu Netdisk backup at $run_time, waiting ${wait_seconds}s."
+  legacy_schedule_values
+  run_time="${BAIDUPAN_BACKUP_TIME:-$LEGACY_BACKUP_TIME}"
+  run_frequency="${BAIDUPAN_BACKUP_FREQUENCY:-$LEGACY_BACKUP_FREQUENCY}"
+  run_time_zone="${BAIDUPAN_TIME_ZONE:-${TZ:-UTC}}"
+  wait_seconds="$(node ./scripts/next-backup-run-delay.mjs "$run_time" "$run_time_zone" "$run_frequency")"
+  echo "Next Baidu Netdisk backup: frequency=$run_frequency time=$run_time timezone=$run_time_zone waiting=${wait_seconds}s."
   sleep "$wait_seconds"
 
   set -a

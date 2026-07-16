@@ -32,3 +32,10 @@ test("configuration exposes one unified Home MinIO management token", () => {
   assert.deepEqual(visibleTokenFields.map((field) => field.key), ["HOME_MINIO_WEB_TOKEN"]);
   assert.equal(CONFIG_FIELDS.get("NEWWAULE_HOME_MINIO_TOKEN")?.hidden, true);
 });
+
+test("backup scheduling uses direct frequency, time and time-zone controls", () => {
+  assert.equal(CONFIG_FIELDS.has("BAIDUPAN_CRON_SCHEDULE"), false);
+  assert.equal(CONFIG_FIELDS.get("BAIDUPAN_BACKUP_FREQUENCY")?.type, "select");
+  assert.equal(CONFIG_FIELDS.get("BAIDUPAN_BACKUP_TIME")?.type, "time");
+  assert.equal(CONFIG_FIELDS.get("BAIDUPAN_TIME_ZONE")?.type, "select");
+});
