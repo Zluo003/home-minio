@@ -21,15 +21,7 @@ parse_daily_time() {
 
 seconds_until_next_run() {
   local hhmm="$1"
-  local hour="${hhmm%:*}"
-  local minute="${hhmm#*:}"
-  local now target
-  now="$(date +%s)"
-  target="$(date -d "today ${hour}:${minute}:00" +%s 2>/dev/null || date -v "${hour}H" -v "${minute}M" -v 0S +%s)"
-  if [[ "$target" -le "$now" ]]; then
-    target="$(date -d "tomorrow ${hour}:${minute}:00" +%s 2>/dev/null || date -v+1d -v "${hour}H" -v "${minute}M" -v 0S +%s)"
-  fi
-  echo $((target - now))
+  node ./scripts/next-daily-run-delay.mjs "$hhmm"
 }
 
 while true; do
