@@ -279,7 +279,7 @@ Open `备份与恢复` in the Home MinIO console and configure:
 BAIDUPAN_BACKUP_ENABLED=true
 BAIDUPAN_TOOL=baidupcs
 BAIDUPAN_REMOTE_DIR=NewWaule/home-minio
-BAIDUPAN_WORK_DIR=./backup
+BAIDUPAN_WORK_DIR=/data/backup
 BAIDUPAN_BACKUP_FREQUENCY=daily
 BAIDUPAN_BACKUP_TIME=03:35
 BAIDUPAN_TIME_ZONE=Asia/Shanghai
@@ -304,9 +304,11 @@ Run the real backup:
 docker compose exec web-api ./scripts/backup-to-baidupan.sh
 ```
 
-The script first mirrors MinIO objects to `backup/mirror/<bucket>/`, then creates an incremental JSONL manifest containing only new, changed, or previously failed files. Baidu Netdisk upload strictly consumes that manifest. Runs, objects, per-file results, and retry state are transactionally persisted in the existing `HOME_MINIO_STATE_DB` SQLite database. The legacy `backup/state/baidupan-uploaded.tsv` is read only once during upgrade to import prior successful uploads.
+The script lists MinIO object metadata and compares object key, size, modification time, and ETag with the durable SQLite state. Its JSONL manifest contains only new, changed, or previously failed files. Unchanged object bodies are never copied into the backup working directory and are not sent to Baidu Netdisk again.
 
-The first run after upgrading performs one full local mirror reconciliation to establish its database baseline. Later runs no longer walk every mirrored file or print one `SKIP` line per completed object: `mc mirror` reports only objects actually copied or changed, and those changes are merged with unfinished database records. MinIO still has to list bucket metadata to detect changes, but unchanged object bodies are not downloaded or sent to Baidu Netdisk.
+For each manifest item, the runner streams that one MinIO object into `backup/spool/<runId>/`, validates it, uploads it to Baidu Netdisk, and immediately removes the temporary file whether the upload succeeds or fails. The working directory therefore contains manifests, logs, and at most the object currently being uploaded instead of a second full media copy. Runs, objects, per-file results, and retry state are transactionally persisted in `HOME_MINIO_STATE_DB`.
+
+After each real backup, files under the old `backup/mirror/<bucket>/` layout are deleted only when SQLite records the same object version as successfully backed up and its key, size, and modification time exactly match the current MinIO object. Pending, failed, missing, or mismatched files are retained and reported as legacy orphans for manual review. The legacy `backup/state/baidupan-uploaded.tsv` is read only once to import prior successful uploads.
 
 Automatic backup is handled by the `backup-scheduler` compose service. Configure its frequency, time, and time zone from the `备份与恢复` page. Existing `BAIDUPAN_CRON_SCHEDULE` values are still read as a legacy fallback, but the Cron expression is no longer exposed in the console.
 

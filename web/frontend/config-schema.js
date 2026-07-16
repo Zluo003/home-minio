@@ -258,9 +258,9 @@ export const CONFIG_PAGES = [
       },
       {
         key: "BAIDUPAN_WORK_DIR",
-        label: "本地备份目录",
-        help: "生成备份清单、日志和临时文件的宿主机目录。",
-        defaultValue: "./backup",
+        label: "备份工作目录",
+        help: "保存清单、日志和单个正在上传的临时文件；临时文件上传后自动删除，不长期保存完整媒体副本。",
+        defaultValue: "/data/backup",
         wide: true,
       },
       {

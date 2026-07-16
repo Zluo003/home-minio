@@ -101,14 +101,14 @@ export class MinioHttpError extends Error {
 }
 
 export function createMinioSignedHttpClient(env, options = {}) {
-  const accessKeyId = env.MINIO_WAULE_ACCESS_KEY || env.MINIO_ROOT_USER;
-  const secretAccessKey = env.MINIO_WAULE_SECRET_KEY || env.MINIO_ROOT_PASSWORD;
+  const accessKeyId = options.accessKeyId || env.MINIO_WAULE_ACCESS_KEY || env.MINIO_ROOT_USER;
+  const secretAccessKey = options.secretAccessKey || env.MINIO_WAULE_SECRET_KEY || env.MINIO_ROOT_PASSWORD;
   if (!accessKeyId || !secretAccessKey) {
     throw new Error("MinIO credentials are not configured.");
   }
   const client = {
-    endpoint: env.MINIO_INTERNAL_ENDPOINT || env.MINIO_UPLOAD_ENDPOINT || "http://minio:9000",
-    region: env.MINIO_REGION || "us-east-1",
+    endpoint: options.endpoint || env.MINIO_INTERNAL_ENDPOINT || env.MINIO_UPLOAD_ENDPOINT || "http://minio:9000",
+    region: options.region || env.MINIO_REGION || "us-east-1",
     bucket: options.bucket || env.MINIO_BUCKET || "waule-media",
     accessKeyId,
     secretAccessKey,
@@ -147,6 +147,7 @@ export function createMinioSignedHttpClient(env, options = {}) {
       return {
         sizeBytes: Number.isSafeInteger(sizeBytes) && sizeBytes >= 0 ? sizeBytes : 0,
         etag: response.headers.get("etag"),
+        lastModified: response.headers.get("last-modified"),
         sha256: response.headers.get("x-amz-meta-sha256"),
         contentType: response.headers.get("content-type"),
       };
@@ -161,6 +162,7 @@ export function createMinioSignedHttpClient(env, options = {}) {
         body: response.body,
         sizeBytes: Number(response.headers.get("content-length")),
         etag: response.headers.get("etag"),
+        lastModified: response.headers.get("last-modified"),
         sha256: response.headers.get("x-amz-meta-sha256"),
         contentType: response.headers.get("content-type"),
       };

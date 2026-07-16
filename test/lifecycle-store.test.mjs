@@ -56,7 +56,7 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
     assert.equal(store.db.pragma("journal_mode", { simple: true }), "wal");
     assert.equal(store.db.pragma("foreign_keys", { simple: true }), 1);
     assert.ok(store.db.pragma("busy_timeout", { simple: true }) >= 5_000);
-    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 6);
+    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 7);
     const indexes = new Set(store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((row) => row.name));
     assert.equal(indexes.has("callback_outbox_run_runnable_idx"), true);
     assert.equal(indexes.has("transfer_items_job_status_idx"), true);
@@ -122,7 +122,7 @@ test("existing v2 lifecycle state upgrades to streaming runs without losing jobs
 
   const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 6);
+    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 7);
     assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM transfer_items").get().count, 1);
     assert.equal(second.getJob("run-before-v2").items[0].home, null);
     assert.ok(second.db.pragma("table_info(transfer_items)").some((column) => column.name === "home_reused"));

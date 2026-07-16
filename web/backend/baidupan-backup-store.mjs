@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 
-export const BAIDUPAN_BACKUP_SCHEMA_VERSION = 6;
+export const BAIDUPAN_BACKUP_SCHEMA_VERSION = 7;
 
 function nowIso() {
   return new Date().toISOString();
@@ -22,73 +22,95 @@ export function migrateBaidupanBackupSchema(db) {
   }
   if (current >= BAIDUPAN_BACKUP_SCHEMA_VERSION) return;
 
-  db.transaction(() => {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS baidupan_backup_metadata (
-        key TEXT PRIMARY KEY,
-        value_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+  let migratedVersion = current;
+  if (migratedVersion < 6) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS baidupan_backup_metadata (
+          key TEXT PRIMARY KEY,
+          value_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS baidupan_backup_objects (
+          bucket TEXT NOT NULL,
+          object_key TEXT NOT NULL,
+          source_size INTEGER,
+          source_mtime INTEGER,
+          status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'MISSING')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          remote_path TEXT,
+          last_error TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          completed_at TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(bucket, object_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS baidupan_backup_objects_status_idx
+          ON baidupan_backup_objects(bucket, status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS baidupan_backup_runs (
+          id TEXT PRIMARY KEY,
+          bucket TEXT NOT NULL,
+          status TEXT NOT NULL,
+          dry_run INTEGER NOT NULL DEFAULT 0,
+          manifest_path TEXT NOT NULL,
+          discovered_count INTEGER NOT NULL DEFAULT 0,
+          queued_count INTEGER NOT NULL DEFAULT 0,
+          succeeded_count INTEGER NOT NULL DEFAULT 0,
+          failed_count INTEGER NOT NULL DEFAULT 0,
+          missing_count INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          finished_at TEXT,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS baidupan_backup_run_items (
+          run_id TEXT NOT NULL REFERENCES baidupan_backup_runs(id) ON DELETE CASCADE,
+          bucket TEXT NOT NULL,
+          object_key TEXT NOT NULL,
+          source_size INTEGER,
+          source_mtime INTEGER,
+          status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'MISSING', 'DRY_RUN')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          remote_path TEXT,
+          error TEXT,
+          started_at TEXT,
+          finished_at TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(run_id, bucket, object_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS baidupan_backup_run_items_status_idx
+          ON baidupan_backup_run_items(run_id, status, object_key);
+      `);
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+        .run(6, nowIso());
+    })();
+    migratedVersion = 6;
+  }
+  if (migratedVersion < 7) {
+    db.transaction(() => {
+      const objectColumns = new Set(
+        db.prepare("PRAGMA table_info(baidupan_backup_objects)").all().map((column) => column.name),
       );
-
-      CREATE TABLE IF NOT EXISTS baidupan_backup_objects (
-        bucket TEXT NOT NULL,
-        object_key TEXT NOT NULL,
-        source_size INTEGER,
-        source_mtime INTEGER,
-        status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'MISSING')),
-        attempt_count INTEGER NOT NULL DEFAULT 0,
-        remote_path TEXT,
-        last_error TEXT,
-        first_seen_at TEXT NOT NULL,
-        last_seen_at TEXT NOT NULL,
-        completed_at TEXT,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(bucket, object_key)
+      const runItemColumns = new Set(
+        db.prepare("PRAGMA table_info(baidupan_backup_run_items)").all().map((column) => column.name),
       );
-
-      CREATE INDEX IF NOT EXISTS baidupan_backup_objects_status_idx
-        ON baidupan_backup_objects(bucket, status, updated_at);
-
-      CREATE TABLE IF NOT EXISTS baidupan_backup_runs (
-        id TEXT PRIMARY KEY,
-        bucket TEXT NOT NULL,
-        status TEXT NOT NULL,
-        dry_run INTEGER NOT NULL DEFAULT 0,
-        manifest_path TEXT NOT NULL,
-        discovered_count INTEGER NOT NULL DEFAULT 0,
-        queued_count INTEGER NOT NULL DEFAULT 0,
-        succeeded_count INTEGER NOT NULL DEFAULT 0,
-        failed_count INTEGER NOT NULL DEFAULT 0,
-        missing_count INTEGER NOT NULL DEFAULT 0,
-        error TEXT,
-        created_at TEXT NOT NULL,
-        started_at TEXT,
-        finished_at TEXT,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS baidupan_backup_run_items (
-        run_id TEXT NOT NULL REFERENCES baidupan_backup_runs(id) ON DELETE CASCADE,
-        bucket TEXT NOT NULL,
-        object_key TEXT NOT NULL,
-        source_size INTEGER,
-        source_mtime INTEGER,
-        status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'MISSING', 'DRY_RUN')),
-        attempt_count INTEGER NOT NULL DEFAULT 0,
-        remote_path TEXT,
-        error TEXT,
-        started_at TEXT,
-        finished_at TEXT,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(run_id, bucket, object_key)
-      );
-
-      CREATE INDEX IF NOT EXISTS baidupan_backup_run_items_status_idx
-        ON baidupan_backup_run_items(run_id, status, object_key);
-    `);
-    db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-      .run(BAIDUPAN_BACKUP_SCHEMA_VERSION, nowIso());
-  })();
+      if (!objectColumns.has("source_etag")) {
+        db.exec("ALTER TABLE baidupan_backup_objects ADD COLUMN source_etag TEXT;");
+      }
+      if (!runItemColumns.has("source_etag")) {
+        db.exec("ALTER TABLE baidupan_backup_run_items ADD COLUMN source_etag TEXT;");
+      }
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+        .run(7, nowIso());
+    })();
+  }
 }
 
 export class BaidupanBackupStore {
@@ -151,29 +173,65 @@ export class BaidupanBackupStore {
     `).all(bucket).map((row) => row.object_key);
   }
 
-  upsertCandidate({ bucket, objectKey, size, mtime, completed = false, forcePending = false, remotePath = null }) {
+  listCompletedObjects(bucket) {
+    return this.db.prepare(`
+      SELECT object_key, source_size, source_mtime, source_etag
+      FROM baidupan_backup_objects
+      WHERE bucket = ? AND status = 'COMPLETED'
+      ORDER BY object_key
+    `).all(bucket);
+  }
+
+  upsertCandidate({
+    bucket,
+    objectKey,
+    size,
+    mtime,
+    etag = null,
+    completed = false,
+    forcePending = false,
+    remotePath = null,
+    seenAt = nowIso(),
+  }) {
     const existing = this.db.prepare(`
       SELECT * FROM baidupan_backup_objects WHERE bucket = ? AND object_key = ?
     `).get(bucket, objectKey);
-    const updatedAt = nowIso();
+    const normalizedEtag = etag ? String(etag).replace(/^"|"$/g, "") : null;
+    const effectiveEtag = normalizedEtag || existing?.source_etag || null;
+    const updatedAt = seenAt;
+    const sameEtag = !existing?.source_etag
+      || !normalizedEtag
+      || existing.source_etag === normalizedEtag;
     const sameSource = existing
       && Number(existing.source_size) === Number(size)
-      && Number(existing.source_mtime) === Number(mtime);
+      && Number(existing.source_mtime) === Number(mtime)
+      && sameEtag;
     const status = !forcePending && (completed || (sameSource && existing.status === "COMPLETED"))
       ? "COMPLETED"
       : "PENDING";
     const completedAt = status === "COMPLETED" ? existing?.completed_at || updatedAt : null;
+    if (
+      existing
+      && sameSource
+      && existing.status === "COMPLETED"
+      && status === "COMPLETED"
+      && !remotePath
+      && existing.source_etag === effectiveEtag
+    ) {
+      return { changed: false, status };
+    }
     this.db.prepare(`
       INSERT INTO baidupan_backup_objects(
-        bucket, object_key, source_size, source_mtime, status, remote_path,
+        bucket, object_key, source_size, source_mtime, source_etag, status, remote_path,
         first_seen_at, last_seen_at, completed_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(bucket, object_key) DO UPDATE SET
         source_size = excluded.source_size,
         source_mtime = excluded.source_mtime,
+        source_etag = excluded.source_etag,
         status = excluded.status,
         remote_path = COALESCE(excluded.remote_path, baidupan_backup_objects.remote_path),
-        last_error = CASE WHEN excluded.status = 'COMPLETED' THEN NULL ELSE baidupan_backup_objects.last_error END,
+        last_error = NULL,
         last_seen_at = excluded.last_seen_at,
         completed_at = excluded.completed_at,
         updated_at = excluded.updated_at
@@ -182,6 +240,7 @@ export class BaidupanBackupStore {
       objectKey,
       Number(size),
       Number(mtime),
+      effectiveEtag,
       status,
       remotePath,
       existing?.first_seen_at || updatedAt,
@@ -189,6 +248,48 @@ export class BaidupanBackupStore {
       completedAt,
       updatedAt,
     );
+    return {
+      changed: !existing || !sameSource,
+      status,
+    };
+  }
+
+  reconcileInventory({ bucket, records, legacyUploadedSignatures = new Set() }) {
+    const seenAt = nowIso();
+    const inventoryKeys = new Set(records.map((record) => record.objectKey));
+    let discoveredCount = 0;
+    const reconcile = this.db.transaction(() => {
+      for (const record of records) {
+        const signature = JSON.stringify([
+          bucket,
+          record.objectKey,
+          String(record.size),
+          String(record.mtime),
+        ]);
+        const result = this.upsertCandidate({
+          bucket,
+          objectKey: record.objectKey,
+          size: record.size,
+          mtime: record.mtime,
+          etag: record.etag,
+          completed: legacyUploadedSignatures.has(signature),
+          seenAt,
+        });
+        if (result.changed) discoveredCount += 1;
+      }
+      for (const row of this.db.prepare(`
+        SELECT object_key
+        FROM baidupan_backup_objects
+        WHERE bucket = ? AND status != 'COMPLETED'
+      `).all(bucket)) {
+        if (!inventoryKeys.has(row.object_key)) this.markMissing(bucket, row.object_key);
+      }
+    });
+    reconcile();
+    return {
+      discoveredCount,
+      objectCount: records.length,
+    };
   }
 
   markMissing(bucket, objectKey) {
@@ -199,9 +300,9 @@ export class BaidupanBackupStore {
     this.db.prepare(`
       INSERT INTO baidupan_backup_objects(
         bucket, object_key, status, last_error, first_seen_at, last_seen_at, updated_at
-      ) VALUES (?, ?, 'MISSING', 'Local mirror file is missing', ?, ?, ?)
+      ) VALUES (?, ?, 'MISSING', 'MinIO source object is missing', ?, ?, ?)
       ON CONFLICT(bucket, object_key) DO UPDATE SET
-        status = 'MISSING', last_error = 'Local mirror file is missing',
+        status = 'MISSING', last_error = 'MinIO source object is missing',
         last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at
     `).run(bucket, objectKey, existing?.first_seen_at || updatedAt, updatedAt, updatedAt);
   }
@@ -216,9 +317,9 @@ export class BaidupanBackupStore {
       `).run(id, bucket, dryRun ? 1 : 0, manifestPath, discoveredCount, createdAt, createdAt);
       this.db.prepare(`
         INSERT INTO baidupan_backup_run_items(
-          run_id, bucket, object_key, source_size, source_mtime, status, error, updated_at
+          run_id, bucket, object_key, source_size, source_mtime, source_etag, status, error, updated_at
         )
-        SELECT ?, bucket, object_key, source_size, source_mtime,
+        SELECT ?, bucket, object_key, source_size, source_mtime, source_etag,
                CASE WHEN status = 'MISSING' THEN 'MISSING' ELSE 'PENDING' END,
                CASE WHEN status = 'MISSING' THEN last_error ELSE NULL END,
                ?
@@ -303,6 +404,7 @@ export class BaidupanBackupStore {
             completed_at = ?, last_seen_at = ?, updated_at = ?
         WHERE bucket = ? AND object_key = ?
           AND source_size = ? AND source_mtime = ?
+          AND COALESCE(source_etag, '') = COALESCE(?, '')
       `).run(
         remotePath,
         completedAt,
@@ -312,6 +414,7 @@ export class BaidupanBackupStore {
         item.object_key,
         item.source_size,
         item.source_mtime,
+        item.source_etag,
       );
     })();
   }
@@ -330,7 +433,16 @@ export class BaidupanBackupStore {
         SET status = 'FAILED', last_error = ?, updated_at = ?
         WHERE bucket = ? AND object_key = ?
           AND source_size = ? AND source_mtime = ?
-      `).run(message, failedAt, item.bucket, item.object_key, item.source_size, item.source_mtime);
+          AND COALESCE(source_etag, '') = COALESCE(?, '')
+      `).run(
+        message,
+        failedAt,
+        item.bucket,
+        item.object_key,
+        item.source_size,
+        item.source_mtime,
+        item.source_etag,
+      );
     })();
   }
 

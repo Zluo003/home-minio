@@ -38,4 +38,6 @@ test("backup scheduling uses direct frequency, time and time-zone controls", () 
   assert.equal(CONFIG_FIELDS.get("BAIDUPAN_BACKUP_FREQUENCY")?.type, "select");
   assert.equal(CONFIG_FIELDS.get("BAIDUPAN_BACKUP_TIME")?.type, "time");
   assert.equal(CONFIG_FIELDS.get("BAIDUPAN_TIME_ZONE")?.type, "select");
+  assert.equal(CONFIG_FIELDS.get("BAIDUPAN_WORK_DIR")?.defaultValue, "/data/backup");
+  assert.match(CONFIG_FIELDS.get("BAIDUPAN_WORK_DIR")?.help || "", /不长期保存完整媒体副本/);
 });
