@@ -115,6 +115,24 @@ export function sourceUrlMatchesObjectKey(sourceUrl, objectKey) {
   }
 }
 
+export function ossSourceUrlMatchesConfig(sourceUrl, objectKey, config) {
+  try {
+    const url = new URL(sourceUrl);
+    const path = decodePathname(url.pathname).replace(/^\/+/, "");
+    const endpoint = String(config?.endpoint || "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    const bucket = String(config?.bucket || "");
+    const directHost = endpoint.startsWith(`${bucket}.`) ? endpoint : `${bucket}.${endpoint}`;
+    if (bucket && endpoint && url.host === directHost && path === objectKey) return true;
+    if (!config?.publicBaseUrl) return false;
+    const publicBase = new URL(config.publicBaseUrl);
+    const publicPrefix = decodePathname(publicBase.pathname).replace(/^\/+|\/+$/g, "");
+    const expectedPath = publicPrefix ? `${publicPrefix}/${objectKey}` : objectKey;
+    return url.origin === publicBase.origin && path === expectedPath;
+  } catch {
+    return false;
+  }
+}
+
 export function takeContiguousCallbackBatch(callbacks, limit = 100) {
   const first = callbacks[0];
   if (!first) return [];
@@ -569,9 +587,31 @@ export class LifecycleTransferService {
   async copySourceToHome(item, signal) {
     throwIfAborted(signal);
     await this.ensureBucket(signal);
+    const job = this.store.getJobControl(item.jobId);
+    const config = job?.config_version_id ? this.store.getDecryptedConfig(job.config_version_id) : null;
+    const sourceProvider = item.sourceProvider
+      || (config && ossSourceUrlMatchesConfig(item.sourceUrl, item.objectKey, config) ? "OSS" : "LOCAL");
+    if (sourceProvider === "OSS" && !config) {
+      throw new PermanentLifecycleTransferError("OSS source requires configVersionId.", 400, "SOURCE_CONFIG_MISSING");
+    }
+    const ossClient = sourceProvider === "OSS" ? this.ossClientFactory(config) : null;
+    const cancelOssClient = () => {
+      try {
+        ossClient?.cancel?.();
+      } catch {
+        // The transfer abort remains authoritative when the SDK has no active request.
+      }
+    };
+    let ossSource = null;
+    if (ossClient) {
+      ossSource = await this.headOssObject(ossClient, item.objectKey, signal);
+      if (!ossSource) {
+        throw new PermanentLifecycleTransferError("OSS source object does not exist.", 404, "SOURCE_MISSING");
+      }
+    }
     const existing = await this.headHomeObject(item.objectKey, signal);
     if (existing) {
-      const expectedHomeSize = item.expectedSizeBytes ?? item.home?.sizeBytes ?? null;
+      const expectedHomeSize = ossSource?.sizeBytes ?? item.expectedSizeBytes ?? item.home?.sizeBytes ?? null;
       const expectedHomeSha256 = item.expectedSha256 || item.home?.sha256 || null;
       const hasVerificationEvidence = expectedHomeSize !== null || Boolean(expectedHomeSha256);
       const sizeMatches = expectedHomeSize === null || existing.sizeBytes === expectedHomeSize;
@@ -583,69 +623,86 @@ export class LifecycleTransferService {
         return { ...existing, sha256: knownSha256, reused: true };
       }
     }
-    if (!sourceUrlMatchesObjectKey(item.sourceUrl, item.objectKey)) {
+    if (sourceProvider === "LOCAL" && !sourceUrlMatchesObjectKey(item.sourceUrl, item.objectKey)) {
       throw new PermanentLifecycleTransferError("Source URL path does not match objectKey.", 400, "SOURCE_URL_MISMATCH");
     }
 
-    const copied = await this.pullSemaphore.use(() => this.httpSemaphore.use(async () => {
-      const response = await this.fetch(item.sourceUrl, {
-        redirect: "follow",
-        signal: combinedSignal(signal, DEFAULT_REQUEST_TIMEOUT_MS),
-      });
-      if (!response.ok || !response.body) {
-        const message = `Source download failed with HTTP ${response.status}.`;
-        if (PERMANENT_HTTP_STATUSES.has(response.status)) {
-          throw new PermanentLifecycleTransferError(
-            message,
-            response.status,
-            response.status === 404 || response.status === 410 ? "SOURCE_MISSING" : "SOURCE_ACCESS_REJECTED",
-          );
+    signal?.addEventListener("abort", cancelOssClient, { once: true });
+    try {
+      const copied = await this.pullSemaphore.use(() => this.httpSemaphore.use(async () => {
+        let sourceBody;
+        let contentLength;
+        let contentType;
+        if (ossClient && ossSource) {
+          const response = await ossClient.getStream(item.objectKey);
+          sourceBody = response.stream;
+          contentLength = ossSource.sizeBytes;
+          contentType = response.res?.headers?.["content-type"] || item.mimeType || "application/octet-stream";
+        } else {
+          const response = await this.fetch(item.sourceUrl, {
+            redirect: "follow",
+            signal: combinedSignal(signal, DEFAULT_REQUEST_TIMEOUT_MS),
+          });
+          if (!response.ok || !response.body) {
+            const message = `Source download failed with HTTP ${response.status}.`;
+            if (PERMANENT_HTTP_STATUSES.has(response.status)) {
+              throw new PermanentLifecycleTransferError(
+                message,
+                response.status,
+                response.status === 404 || response.status === 410 ? "SOURCE_MISSING" : "SOURCE_ACCESS_REJECTED",
+              );
+            }
+            throw new Error(message);
+          }
+          sourceBody = response.body;
+          contentLength = Number(response.headers.get("content-length"));
+          contentType = item.mimeType || response.headers.get("content-type") || "application/octet-stream";
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+            throw new PermanentLifecycleTransferError("Source response is missing a valid Content-Length.", 400, "SOURCE_METADATA_INVALID");
+          }
+          if (item.expectedSizeBytes != null && contentLength !== item.expectedSizeBytes) {
+            throw new PermanentLifecycleTransferError(
+              `Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`,
+              400,
+              "CONTENT_MISMATCH",
+            );
+          }
         }
-        throw new Error(message);
-      }
-      const contentLength = Number(response.headers.get("content-length"));
-      if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
-        throw new PermanentLifecycleTransferError("Source response is missing a valid Content-Length.", 400, "SOURCE_METADATA_INVALID");
-      }
-      if (item.expectedSizeBytes != null && contentLength !== item.expectedSizeBytes) {
-        throw new PermanentLifecycleTransferError(
-          `Source size mismatch: expected ${item.expectedSizeBytes}, received ${contentLength}.`,
-          400,
-          "CONTENT_MISMATCH",
-        );
-      }
 
-      const hash = createHash("sha256");
-      let copiedBytes = 0;
-      const recordTransferredBytes = (bytes) => this.recordTransferredBytes(bytes);
-      const counter = new Transform({
-        transform(chunk, _encoding, callback) {
-          copiedBytes += chunk.length;
-          hash.update(chunk);
-          recordTransferredBytes(chunk.length);
-          callback(null, chunk);
-        },
-      });
-      const body = nodeReadable(response.body).pipe(counter);
-      const upload = await this.minioClient.putObject(item.objectKey, body, {
-        contentLength,
-        contentType: item.mimeType || response.headers.get("content-type") || "application/octet-stream",
-        signal,
-      });
-      if (copiedBytes !== contentLength) {
-        throw new Error(`Home MinIO copy ended at ${copiedBytes} of ${contentLength} bytes.`);
+        const hash = createHash("sha256");
+        let copiedBytes = 0;
+        const recordTransferredBytes = (bytes) => this.recordTransferredBytes(bytes);
+        const counter = new Transform({
+          transform(chunk, _encoding, callback) {
+            copiedBytes += chunk.length;
+            hash.update(chunk);
+            recordTransferredBytes(chunk.length);
+            callback(null, chunk);
+          },
+        });
+        const body = nodeReadable(sourceBody).pipe(counter);
+        const upload = await this.minioClient.putObject(item.objectKey, body, {
+          contentLength,
+          contentType,
+          signal,
+        });
+        if (copiedBytes !== contentLength) {
+          throw new Error(`Home MinIO copy ended at ${copiedBytes} of ${contentLength} bytes.`);
+        }
+        const sha256 = hash.digest("hex");
+        if (item.expectedSha256 && sha256 !== item.expectedSha256) {
+          throw new PermanentLifecycleTransferError("Source SHA-256 does not match the expected checksum.", 400, "CONTENT_MISMATCH");
+        }
+        return { contentLength, uploadEtag: normalizeEtag(upload.etag), sha256 };
+      }, 2));
+      const verified = await this.headHomeObject(item.objectKey, signal);
+      if (!verified || verified.sizeBytes !== copied.contentLength) {
+        throw new Error("Home MinIO HEAD verification failed after upload.");
       }
-      const sha256 = hash.digest("hex");
-      if (item.expectedSha256 && sha256 !== item.expectedSha256) {
-        throw new PermanentLifecycleTransferError("Source SHA-256 does not match the expected checksum.", 400, "CONTENT_MISMATCH");
-      }
-      return { contentLength, uploadEtag: normalizeEtag(upload.etag), sha256 };
-    }, 2));
-    const verified = await this.headHomeObject(item.objectKey, signal);
-    if (!verified || verified.sizeBytes !== copied.contentLength) {
-      throw new Error("Home MinIO HEAD verification failed after upload.");
+      return { ...verified, etag: verified.etag || copied.uploadEtag, sha256: copied.sha256, reused: false };
+    } finally {
+      signal?.removeEventListener("abort", cancelOssClient);
     }
-    return { ...verified, etag: verified.etag || copied.uploadEtag, sha256: copied.sha256, reused: false };
   }
 
   async hashHomeObject(objectKey, signal) {

@@ -56,7 +56,7 @@ test("SQLite lifecycle state enables WAL, foreign keys and a busy timeout", asyn
     assert.equal(store.db.pragma("journal_mode", { simple: true }), "wal");
     assert.equal(store.db.pragma("foreign_keys", { simple: true }), 1);
     assert.ok(store.db.pragma("busy_timeout", { simple: true }) >= 5_000);
-    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 7);
+    assert.equal(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 8);
     const indexes = new Set(store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all().map((row) => row.name));
     assert.equal(indexes.has("callback_outbox_run_runnable_idx"), true);
     assert.equal(indexes.has("transfer_items_job_status_idx"), true);
@@ -106,6 +106,7 @@ test("existing v2 lifecycle state upgrades to streaming runs without losing jobs
     ALTER TABLE transfer_items DROP COLUMN failure_kind;
     ALTER TABLE transfer_items DROP COLUMN failure_status_code;
     ALTER TABLE transfer_items DROP COLUMN retryable;
+    ALTER TABLE transfer_items DROP COLUMN source_provider;
     ALTER TABLE transfer_jobs DROP COLUMN manifest_url;
     ALTER TABLE transfer_jobs DROP COLUMN manifest_token;
     ALTER TABLE transfer_jobs DROP COLUMN callback_url;
@@ -122,7 +123,7 @@ test("existing v2 lifecycle state upgrades to streaming runs without losing jobs
 
   const second = new LifecycleStore({ dbPath, encryptionKey: null });
   try {
-    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 7);
+    assert.equal(second.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 8);
     assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM transfer_items").get().count, 1);
     assert.equal(second.getJob("run-before-v2").items[0].home, null);
     assert.ok(second.db.pragma("table_info(transfer_items)").some((column) => column.name === "home_reused"));
@@ -496,6 +497,7 @@ test("schema v4 restores exhausted callbacks for completed legacy runs", async (
     WHERE id = ?
   `).run(callback.id);
   first.db.prepare("UPDATE transfer_jobs SET status = 'FAILED', error = 'legacy callback failure' WHERE id = ?").run(run.id);
+  first.db.exec("ALTER TABLE transfer_items DROP COLUMN source_provider;");
   first.db.prepare("DELETE FROM schema_migrations WHERE version >= 4").run();
   first.close();
 
@@ -694,6 +696,31 @@ test("lifecycle jobs are idempotent and reject job id reuse with different data"
       () => store.createJob({ ...payload, items: [{ ...payload.items[0], objectKey: "gateway-media/other.png" }] }),
       LifecycleConflictError,
     );
+  });
+});
+
+test("legacy lifecycle jobs accept source provider enrichment without changing object identity", async () => {
+  await withStore(({ store }) => {
+    const configVersion = store.upsertConfigVersion(ossConfig);
+    const input = {
+      id: "legacy-provider-enrichment",
+      mediaKind: "GENERATED_MEDIA",
+      configVersionId: configVersion.id,
+      items: [{
+        lifecycleObjectId: "legacy-provider-object",
+        objectKey: "gateway-media/legacy-provider.png",
+        sourceUrl: "https://cdn.example.test/gateway-media/legacy-provider.png",
+        targetTier: "COLD_HOME_MINIO",
+        expectedSizeBytes: 12,
+      }],
+    };
+    const legacy = store.createJob(input);
+    assert.equal(legacy.items[0].sourceProvider, null);
+    const enriched = store.createJob({
+      ...input,
+      items: [{ ...input.items[0], sourceProvider: "OSS" }],
+    });
+    assert.equal(enriched.items[0].sourceProvider, "OSS");
   });
 });
 

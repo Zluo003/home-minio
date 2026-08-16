@@ -7,6 +7,7 @@ import { Readable } from "node:stream";
 import test from "node:test";
 import {
   LifecycleTransferService,
+  ossSourceUrlMatchesConfig,
   redactLifecycleMessage,
   sourceUrlMatchesObjectKey,
   takeContiguousCallbackBatch,
@@ -64,6 +65,18 @@ function createFakeOssClient(objects, metadata, multipartCalls, multipartControl
       objects.set(key, value);
       metadata.set(key, options?.meta || {});
       return { res: { headers: { etag: `"oss-${value.length}"` } } };
+    },
+    async getStream(key) {
+      const value = objects.get(key);
+      if (!value) {
+        const error = new Error("not found");
+        error.status = 404;
+        throw error;
+      }
+      return {
+        stream: Readable.from(value),
+        res: { headers: { "content-length": String(value.length), "content-type": "image/png" } },
+      };
     },
     async multipartUpload(key, filePath, options) {
       const { readFile } = await import("node:fs/promises");
@@ -166,6 +179,74 @@ test("source URL validation requires an exact object key path", () => {
   assert.equal(sourceUrlMatchesObjectKey("https://api.test/local-media/gateway-media/other.png", "gateway-media/a.png"), false);
   assert.equal(sourceUrlMatchesObjectKey("file:///tmp/a.png", "a.png"), false);
   assert.equal(sourceUrlMatchesObjectKey("https://cdn.test/media-prefix/gateway-media/a.png", "gateway-media/a.png"), true);
+});
+
+test("legacy OSS source detection supports direct and configured CDN URLs", () => {
+  const config = {
+    bucket: "media-test",
+    endpoint: "oss-cn-beijing.aliyuncs.com",
+    publicBaseUrl: "https://cdn.example.test/media",
+  };
+  const objectKey = "gateway-media/2026/a b.png";
+  assert.equal(
+    ossSourceUrlMatchesConfig(
+      "https://media-test.oss-cn-beijing.aliyuncs.com/gateway-media/2026/a%20b.png",
+      objectKey,
+      config,
+    ),
+    true,
+  );
+  assert.equal(
+    ossSourceUrlMatchesConfig("https://cdn.example.test/media/gateway-media/2026/a%20b.png?version=1", objectKey, config),
+    true,
+  );
+  assert.equal(
+    ossSourceUrlMatchesConfig("https://api.example.test/local-media/gateway-media/2026/a%20b.png", objectKey, config),
+    false,
+  );
+});
+
+test("OSS sources use the SDK for direct and CDN URLs instead of anonymous fetch", async () => {
+  const body = Buffer.from("sdk-source-current-content");
+  const context = await setupService({ body });
+  try {
+    const configVersion = context.store.upsertConfigVersion({
+      bucket: "media-test",
+      region: "cn-beijing",
+      endpoint: "oss-cn-beijing.aliyuncs.com",
+      accessKeyId: "test-access-key",
+      accessKeySecret: "test-secret",
+      publicBaseUrl: "https://cdn.example.test/media",
+    });
+    for (const [suffix, sourceUrl, sourceProvider] of [
+      ["direct", "https://media-test.oss-cn-beijing.aliyuncs.com/gateway-media/direct.png", "OSS"],
+      ["cdn", "https://cdn.example.test/media/gateway-media/cdn.png", "OSS"],
+      ["legacy", "https://cdn.example.test/media/gateway-media/legacy.png", null],
+    ]) {
+      const objectKey = `gateway-media/${suffix}.png`;
+      context.ossObjects.set(objectKey, body);
+      const job = context.store.createJob({
+        id: `oss-source-${suffix}`,
+        mediaKind: "GENERATED_MEDIA",
+        configVersionId: configVersion.id,
+        items: [{
+          lifecycleObjectId: `media-${suffix}`,
+          objectKey,
+          sourceUrl,
+          ...(sourceProvider ? { sourceProvider } : {}),
+          targetTier: "COLD_HOME_MINIO",
+          expectedSizeBytes: body.length - 1,
+          mimeType: "image/png",
+        }],
+      });
+      await context.service.processItem(job.items[0].id);
+      assert.equal(context.store.getJob(job.id).items[0].status, "SUCCEEDED");
+      assert.deepEqual(context.minio.objects.get(objectKey), body);
+    }
+    assert.equal(context.stats.sourceFetchCount, 0);
+  } finally {
+    await cleanup(context);
+  }
 });
 
 test("callback delivery batches stop at sequence gaps", () => {

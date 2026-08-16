@@ -7,7 +7,7 @@ import {
   migrateBaidupanBackupSchema,
 } from "./baidupan-backup-store.mjs";
 
-const SCHEMA_VERSION = BAIDUPAN_BACKUP_SCHEMA_VERSION;
+const SCHEMA_VERSION = 8;
 const JOB_TERMINAL_STATUSES = new Set(["SUCCEEDED", "SUCCEEDED_WITH_ERRORS", "FAILED", "CANCELLED"]);
 const ITEM_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
@@ -161,6 +161,9 @@ function normalizeLifecycleItem(item, index = 0) {
     throw new LifecycleValidationError(`Lifecycle item ${index + 1} is invalid.`);
   }
   const sourceUrl = normalizeHttpUrl(item?.sourceUrl, `Lifecycle item ${index + 1} sourceUrl`);
+  const sourceProvider = item?.sourceProvider === "LOCAL" || item?.sourceProvider === "OSS"
+    ? item.sourceProvider
+    : null;
   const expectedSizeBytes = item?.expectedSizeBytes == null ? null : Number(item.expectedSizeBytes);
   if (expectedSizeBytes !== null && (!Number.isSafeInteger(expectedSizeBytes) || expectedSizeBytes < 0)) {
     throw new LifecycleValidationError(`Lifecycle item ${index + 1} expectedSizeBytes is invalid.`);
@@ -169,6 +172,7 @@ function normalizeLifecycleItem(item, index = 0) {
     lifecycleObjectId,
     objectKey,
     sourceUrl,
+    sourceProvider,
     targetTier,
     expectedSizeBytes,
     expectedSha256: typeof item?.expectedSha256 === "string" && /^[a-f\d]{64}$/i.test(item.expectedSha256)
@@ -208,6 +212,7 @@ function serializeItem(row) {
     lifecycleObjectId: row.lifecycle_object_id,
     objectKey: row.object_key,
     sourceUrl: row.source_url,
+    sourceProvider: row.source_provider || null,
     targetTier: row.target_tier,
     status: row.status,
     stage: row.stage,
@@ -579,6 +584,13 @@ export class LifecycleStore {
     }
     if (current < BAIDUPAN_BACKUP_SCHEMA_VERSION) {
       migrateBaidupanBackupSchema(this.db);
+      current = this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version;
+    }
+    if (current < SCHEMA_VERSION) {
+      this.db.transaction(() => {
+        this.db.exec("ALTER TABLE transfer_items ADD COLUMN source_provider TEXT CHECK (source_provider IN ('LOCAL', 'OSS'));");
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, nowIso());
+      })();
     }
   }
 
@@ -818,15 +830,21 @@ export class LifecycleStore {
       const find = this.db.prepare("SELECT * FROM transfer_items WHERE job_id = ? AND lifecycle_object_id = ?");
       const insert = this.db.prepare(`
         INSERT INTO transfer_items(
-          id, job_id, lifecycle_object_id, object_key, source_url, target_tier,
+          id, job_id, lifecycle_object_id, object_key, source_url, source_provider, target_tier,
           expected_size_bytes, expected_sha256, mime_type, status, stage, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', ?, ?)
       `);
       for (const item of items) {
         const existing = find.get(runId, item.lifecycleObjectId);
         if (existing) {
+          if (existing.source_provider === null && item.sourceProvider !== null) {
+            this.db.prepare("UPDATE transfer_items SET source_provider = ?, updated_at = ? WHERE id = ?")
+              .run(item.sourceProvider, insertedAt, existing.id);
+            existing.source_provider = item.sourceProvider;
+          }
           const same = existing.object_key === item.objectKey
             && existing.source_url === item.sourceUrl
+            && existing.source_provider === item.sourceProvider
             && existing.target_tier === item.targetTier
             && existing.expected_size_bytes === item.expectedSizeBytes
             && existing.expected_sha256 === item.expectedSha256
@@ -835,7 +853,7 @@ export class LifecycleStore {
           continue;
         }
         insert.run(
-          randomUUID(), runId, item.lifecycleObjectId, item.objectKey, item.sourceUrl, item.targetTier,
+          randomUUID(), runId, item.lifecycleObjectId, item.objectKey, item.sourceUrl, item.sourceProvider, item.targetTier,
           item.expectedSizeBytes, item.expectedSha256, item.mimeType, insertedAt, insertedAt,
         );
       }
@@ -923,7 +941,38 @@ export class LifecycleStore {
     const existing = this.db.prepare("SELECT * FROM transfer_jobs WHERE id = ?").get(id);
     if (existing) {
       if (existing.request_fingerprint !== fingerprint) {
-        throw new LifecycleConflictError("Lifecycle job id already exists with a different payload.");
+        const existingItems = this.db.prepare("SELECT * FROM transfer_items WHERE job_id = ?").all(id);
+        const existingByLifecycleId = new Map(existingItems.map((item) => [item.lifecycle_object_id, item]));
+        const compatibleUpgrade = existing.media_kind === mediaKind
+          && existing.config_version_id === configVersionId
+          && existingItems.length === normalizedItems.length
+          && normalizedItems.every((item) => {
+            const stored = existingByLifecycleId.get(item.lifecycleObjectId);
+            return stored
+              && stored.object_key === item.objectKey
+              && stored.source_url === item.sourceUrl
+              && (stored.source_provider === null || stored.source_provider === item.sourceProvider)
+              && stored.target_tier === item.targetTier
+              && stored.expected_size_bytes === item.expectedSizeBytes
+              && stored.expected_sha256 === item.expectedSha256
+              && stored.mime_type === item.mimeType;
+          });
+        if (!compatibleUpgrade) {
+          throw new LifecycleConflictError("Lifecycle job id already exists with a different payload.");
+        }
+        this.db.transaction(() => {
+          const updateProvider = this.db.prepare(`
+            UPDATE transfer_items
+            SET source_provider = ?, updated_at = ?
+            WHERE job_id = ? AND lifecycle_object_id = ? AND source_provider IS NULL
+          `);
+          const updatedAt = nowIso();
+          for (const item of normalizedItems) {
+            if (item.sourceProvider) updateProvider.run(item.sourceProvider, updatedAt, id, item.lifecycleObjectId);
+          }
+          this.db.prepare("UPDATE transfer_jobs SET request_fingerprint = ?, updated_at = ? WHERE id = ?")
+            .run(fingerprint, updatedAt, id);
+        })();
       }
       return this.getJob(id);
     }
@@ -947,13 +996,13 @@ export class LifecycleStore {
       );
       const statement = this.db.prepare(`
         INSERT INTO transfer_items(
-          id, job_id, lifecycle_object_id, object_key, source_url, target_tier,
+          id, job_id, lifecycle_object_id, object_key, source_url, source_provider, target_tier,
           expected_size_bytes, expected_sha256, mime_type, status, stage, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', ?, ?)
       `);
       for (const item of normalizedItems) {
         statement.run(
-          randomUUID(), id, item.lifecycleObjectId, item.objectKey, item.sourceUrl, item.targetTier,
+          randomUUID(), id, item.lifecycleObjectId, item.objectKey, item.sourceUrl, item.sourceProvider, item.targetTier,
           item.expectedSizeBytes, item.expectedSha256, item.mimeType, createdAt, createdAt,
         );
       }
