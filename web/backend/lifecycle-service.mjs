@@ -147,6 +147,12 @@ export function takeContiguousCallbackBatch(callbacks, limit = 100) {
   return batch;
 }
 
+function callbackBatchLimit(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return 25;
+  return Math.min(100, Math.max(1, parsed));
+}
+
 function nodeReadable(body) {
   if (!body) throw new Error("Object response body is empty.");
   if (body instanceof Readable) return body;
@@ -491,7 +497,7 @@ export class LifecycleTransferService {
     if (!first) return;
     const group = takeContiguousCallbackBatch(
       runnable.filter((item) => item.runId === first.runId),
-      100,
+      callbackBatchLimit(this.env?.NEWWAULE_CALLBACK_BATCH_SIZE),
     );
     const claimed = this.store.claimCallbacks(group.map((item) => item.id));
     if (!claimed.length) return;
