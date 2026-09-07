@@ -10,6 +10,8 @@ test("the web console reaches its API through the same-origin nginx proxy", () =
   assert.match(appSource, /const API_BASE = location\.origin;/);
   assert.doesNotMatch(appSource, /location\.hostname}:19090/);
   assert.match(nginxTemplate, /location \/api\//);
-  assert.match(nginxTemplate, /proxy_pass http:\/\/web-api:\$\{HOME_MINIO_WEB_API_PORT\};/);
+  assert.match(nginxTemplate, /resolver 127\.0\.0\.11 valid=10s ipv6=off;/);
+  assert.match(nginxTemplate, /set \$home_minio_web_api "http:\/\/web-api:\$\{HOME_MINIO_WEB_API_PORT\}";/);
+  assert.match(nginxTemplate, /proxy_pass \$home_minio_web_api;/);
   assert.match(composeSource, /default\.conf\.template:\/etc\/nginx\/templates\/default\.conf\.template:ro/);
 });

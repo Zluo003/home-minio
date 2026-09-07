@@ -29,10 +29,33 @@ async function api(path, options = {}, retried = false) {
     localStorage.setItem("homeMinioToken", token);
     return api(path, options, true);
   }
-  const data = await response.json();
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    const looksJsonLike = /^[\s\r\n]*[\[{]/.test(text);
+    if (contentType.includes("application/json") || contentType.includes("+json")) {
+      if (!response.ok && !looksJsonLike) {
+        data = text;
+      } else {
+        try {
+          data = JSON.parse(text);
+        } catch (error) {
+          throw new Error(`API 返回了无效 JSON：${text.slice(0, 200)}`);
+        }
+      }
+    } else {
+      data = text;
+    }
+  } else {
+    data = {};
+  }
   if (!response.ok) {
-    const commandOutput = [data.stdout, data.stderr].filter(Boolean).join("\n");
-    throw new Error(commandOutput || data.message || response.statusText);
+    const commandOutput = data && typeof data === "object"
+      ? [data.stdout, data.stderr].filter(Boolean).join("\n")
+      : "";
+    const bodyText = typeof data === "string" ? data : data?.message;
+    throw new Error(commandOutput || bodyText || response.statusText);
   }
   return data;
 }
